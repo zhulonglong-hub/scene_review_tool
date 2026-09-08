@@ -1,9 +1,9 @@
 {
   "dataset_name": "CDUWD1.0-512",
-  "image_root": "D:/硕士毕业论文/相关图文数据集/自有数据集/CDUWD1.0/512",
-  "mask_root": "D:/硕士毕业论文/相关图文数据集/自有数据集/CDUWD1.0/512",
-  "workspace": "D:/硕士毕业论文/scene_review_tool/workspaces/CDUWD1.0-512",
-  "taxonomy_path": "D:/硕士毕业论文/ppt相关/geo_scene_taxonomy_1.0.json",
+  "image_root": "",
+  "mask_root": "",
+  "workspace": "",
+  "taxonomy_path": "",
   "pairing": {
     "mode": "mirrored_subdirectories",
     "image_dir_name": "images",

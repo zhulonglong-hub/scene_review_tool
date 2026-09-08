@@ -14,10 +14,35 @@ from scene_review_tool.app import (
 )
 
 
-def test_taxonomy_loads_project_taxonomy():
-    taxonomy = Taxonomy(Path("D:/硕士毕业论文/ppt相关/geo_scene_taxonomy_1.0.json"))
+def test_taxonomy_loads_project_taxonomy(tmp_path):
+    taxonomy_path = tmp_path / "taxonomy.json"
+    taxonomy_path.write_text(
+        """
+        {
+          "version": "1.0",
+          "domains": [
+            {
+              "id": "G1",
+              "name_zh": "水系与湿地",
+              "name_en": "Water",
+              "scenes": [{"scene": "river", "elements": ["water"]}]
+            }
+          ]
+        }
+        """,
+        encoding="utf-8",
+    )
+    taxonomy = Taxonomy(taxonomy_path)
     assert taxonomy.version == "1.0"
     assert taxonomy.find_scene("river") is not None
+
+
+def test_taxonomy_can_be_omitted():
+    taxonomy = Taxonomy()
+
+    assert taxonomy.path is None
+    assert taxonomy.scenes == []
+    assert taxonomy.domains == []
 
 
 def test_mirrored_subdirectories_scan(tmp_path):
@@ -111,7 +136,7 @@ def test_binary_mask_value_one_is_rendered_as_foreground(tmp_path):
 
 def test_database_persists_samples(tmp_path):
     db = ReviewDatabase(tmp_path / "review.sqlite3")
-    taxonomy = Taxonomy(Path("D:/硕士毕业论文/ppt相关/geo_scene_taxonomy_1.0.json"))
+    taxonomy = Taxonomy()
     dataset_id = db.create_dataset("demo", tmp_path, tmp_path, {"pairing": {}}, taxonomy)
     assert dataset_id == 1
     db.close()
@@ -119,7 +144,7 @@ def test_database_persists_samples(tmp_path):
 
 def test_common_scene_count_is_assigned_sample_count(tmp_path):
     db = ReviewDatabase(tmp_path / "review.sqlite3")
-    taxonomy = Taxonomy(Path("D:/硕士毕业论文/ppt相关/geo_scene_taxonomy_1.0.json"))
+    taxonomy = Taxonomy()
     dataset_id = db.create_dataset("demo", tmp_path, tmp_path, {"pairing": {}}, taxonomy)
     sample = Sample("s1", "image.png", "mask.png", "group")
     db.add_samples([sample], dataset_id)

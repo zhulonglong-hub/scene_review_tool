@@ -176,15 +176,18 @@ def stable_sample_id(dataset_name: str, image_path: Path) -> str:
 
 
 class Taxonomy:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path | None = None) -> None:
         self.path = path
         self.version = ""
         self.sha256 = ""
         self.scenes: list[Scene] = []
         self.by_domain: dict[str, list[Scene]] = {}
-        self.load()
+        if path is not None:
+            self.load()
 
     def load(self) -> None:
+        if self.path is None:
+            return
         data = self.path.read_bytes()
         self.sha256 = hashlib.sha256(data).hexdigest()
         obj = json.loads(data.decode("utf-8"))
@@ -857,8 +860,8 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("Scene Review Tool")
         self.resize(1500, 900)
-        self.taxonomy_path = Path("D:/硕士毕业论文/ppt相关/geo_scene_taxonomy_1.0.json")
-        self.taxonomy = Taxonomy(self.taxonomy_path)
+        self.taxonomy_path: Path | None = None
+        self.taxonomy = Taxonomy()
         self.db: ReviewDatabase | None = None
         self.dataset_id: int | None = None
         self.mask_foreground_values: set[int] | None = {1}
@@ -886,10 +889,12 @@ class MainWindow(QMainWindow):
 
         form_box = QGroupBox("项目导入")
         form = QFormLayout(form_box)
-        greenland_root = "D:/硕士毕业论文/相关图文数据集/自有数据集/greenland_3968x3968_test512"
-        self.dataset_name_edit = QLineEdit("Greenland-512")
-        self.workspace_edit = QLineEdit("D:/硕士毕业论文/scene_review_tool/workspaces/Greenland-512")
-        self.taxonomy_edit = QLineEdit(str(self.taxonomy_path))
+        self.dataset_name_edit = QLineEdit()
+        self.dataset_name_edit.setPlaceholderText("例如 Greenland-512")
+        self.workspace_edit = QLineEdit()
+        self.workspace_edit.setPlaceholderText("请选择或输入用于保存审查进度的文件夹")
+        self.taxonomy_edit = QLineEdit()
+        self.taxonomy_edit.setPlaceholderText("可选；留空时使用数据集自定义场景")
 
         self.import_type_combo = QComboBox()
         self.import_type_combo.addItem("通用图像-Mask文件夹", "generic")
@@ -899,8 +904,10 @@ class MainWindow(QMainWindow):
         generic_page = QWidget()
         generic_form = QFormLayout(generic_page)
         generic_form.setContentsMargins(0, 4, 0, 4)
-        self.image_root_edit = QLineEdit(f"{greenland_root}/JPEGImages")
-        self.mask_root_edit = QLineEdit(f"{greenland_root}/SegmentationClass")
+        self.image_root_edit = QLineEdit()
+        self.image_root_edit.setPlaceholderText("请选择图像所在文件夹")
+        self.mask_root_edit = QLineEdit()
+        self.mask_root_edit.setPlaceholderText("请选择 Mask 所在文件夹")
         self.generic_pairing_combo = QComboBox()
         self.generic_pairing_combo.addItem("同名文件（忽略扩展名）", "same_stem")
         self.generic_pairing_combo.addItem("相对路径与文件名均相同", "relative_path_stem")
@@ -915,9 +922,12 @@ class MainWindow(QMainWindow):
         voc_page = QWidget()
         voc_form = QFormLayout(voc_page)
         voc_form.setContentsMargins(0, 4, 0, 4)
-        self.voc_root_edit = QLineEdit(greenland_root)
-        self.image_dir_name_edit = QLineEdit("JPEGImages")
-        self.mask_dir_name_edit = QLineEdit("SegmentationClass")
+        self.voc_root_edit = QLineEdit()
+        self.voc_root_edit.setPlaceholderText("请选择 VOC 数据集根目录")
+        self.image_dir_name_edit = QLineEdit()
+        self.image_dir_name_edit.setPlaceholderText("默认 JPEGImages")
+        self.mask_dir_name_edit = QLineEdit()
+        self.mask_dir_name_edit.setPlaceholderText("默认 SegmentationClass")
         self.split_combo = QComboBox()
         self.split_combo.setEditable(True)
         self.split_combo.addItems(["all", "train", "val", "test"])
@@ -928,14 +938,15 @@ class MainWindow(QMainWindow):
         self.import_options_stack.addWidget(voc_page)
         self.import_type_combo.currentIndexChanged.connect(self.import_options_stack.setCurrentIndex)
 
-        self.mask_values_edit = QLineEdit("1")
-        self.mask_values_edit.setPlaceholderText("多个标签用英文逗号分隔，例如 1,2")
-        self.mask_name_edit = QLineEdit("green space")
+        self.mask_values_edit = QLineEdit()
+        self.mask_values_edit.setPlaceholderText("必填；多个标签用英文逗号分隔，例如 1,2")
+        self.mask_name_edit = QLineEdit()
+        self.mask_name_edit.setPlaceholderText("可选，例如 green space；默认 foreground")
         form.addRow("数据集名称", self.dataset_name_edit)
         form.addRow("导入方式", self.import_type_combo)
         form.addRow(self.import_options_stack)
         form.addRow("工作区", self._path_row(self.workspace_edit, True))
-        form.addRow("场景体系 JSON", self._path_row(self.taxonomy_edit, False))
+        form.addRow("场景体系 JSON（可选）", self._path_row(self.taxonomy_edit, False))
         form.addRow("Mask 前景标签值", self.mask_values_edit)
         form.addRow("Mask 前景名称", self.mask_name_edit)
         layout.addWidget(form_box)
@@ -1096,8 +1107,6 @@ class MainWindow(QMainWindow):
         self.scene_source_combo.addItems(SCENE_SOURCES)
         self.scene_source_combo.currentTextChanged.connect(self.on_scene_source_changed)
         self.domain_combo = QComboBox()
-        for domain_id, name_zh, name_en in self.taxonomy.domains:
-            self.domain_combo.addItem(f"{domain_id} {name_zh} / {name_en}", domain_id)
         self.domain_combo.currentIndexChanged.connect(self.reload_scene_combo)
         self.scene_combo = QComboBox()
         self.custom_en_edit = QLineEdit()
@@ -1120,12 +1129,12 @@ class MainWindow(QMainWindow):
         scene_actions_layout.setContentsMargins(0, 0, 0, 0)
         confirm_scene_btn = QPushButton("确认场景")
         confirm_scene_btn.clicked.connect(self.confirm_scene_selection)
-        reset_taxonomy_btn = QPushButton("改用正式体系")
-        reset_taxonomy_btn.clicked.connect(self.reset_to_taxonomy_scene)
+        self.reset_taxonomy_btn = QPushButton("改用正式体系")
+        self.reset_taxonomy_btn.clicked.connect(self.reset_to_taxonomy_scene)
         clear_scene_btn = QPushButton("清空")
         clear_scene_btn.clicked.connect(self.clear_scene_selection)
         scene_actions_layout.addWidget(confirm_scene_btn)
-        scene_actions_layout.addWidget(reset_taxonomy_btn)
+        scene_actions_layout.addWidget(self.reset_taxonomy_btn)
         scene_actions_layout.addWidget(clear_scene_btn)
         scene_layout.addRow("", scene_actions)
         self.scene_hint_label = QLabel("点击常用场景只填入候选，确认后保存。")
@@ -1139,8 +1148,7 @@ class MainWindow(QMainWindow):
         self.note_edit = QTextEdit()
         note_layout.addWidget(self.note_edit)
         layout.addWidget(note_box)
-        self.reload_scene_combo()
-        self.on_scene_source_changed("taxonomy")
+        self.refresh_taxonomy_controls()
         return panel
 
     def _apply_style(self) -> None:
@@ -1171,10 +1179,22 @@ class MainWindow(QMainWindow):
 
     def collect_import_data(self) -> dict[str, Any]:
         dataset_name = self.dataset_name_edit.text().strip()
-        workspace = Path(self.workspace_edit.text().strip())
-        taxonomy_path = Path(self.taxonomy_edit.text().strip())
-        if not dataset_name or not self.workspace_edit.text().strip() or not taxonomy_path.is_file():
-            raise ValueError("请检查数据集名称、工作区和场景体系路径。")
+        workspace_text = self.workspace_edit.text().strip()
+        if not dataset_name:
+            raise ValueError("请填写数据集名称。")
+        if not workspace_text:
+            raise ValueError("请选择或输入工作区。")
+        workspace = Path(workspace_text)
+        taxonomy_text = self.taxonomy_edit.text().strip()
+        taxonomy_path: Path | None = None
+        taxonomy = Taxonomy()
+        if taxonomy_text:
+            taxonomy_path = Path(taxonomy_text)
+            if not taxonomy_path.is_file():
+                raise ValueError("场景体系 JSON 不存在；不使用场景体系时请将该项留空。")
+            taxonomy = Taxonomy(taxonomy_path)
+            if not taxonomy.scenes:
+                raise ValueError("场景体系 JSON 中没有可用的场景。")
 
         import_type = self.import_type_combo.currentData()
         if import_type == "voc":
@@ -1236,7 +1256,7 @@ class MainWindow(QMainWindow):
             "import_type": import_type,
             "image_root": normalized_path(image_root),
             "mask_root": normalized_path(mask_root),
-            "taxonomy_path": normalized_path(taxonomy_path),
+            "taxonomy_path": normalized_path(taxonomy_path) if taxonomy_path else "",
             "pairing": {
                 "mode": mode,
                 "image_dir_name": image_dir_name,
@@ -1262,6 +1282,7 @@ class MainWindow(QMainWindow):
             "mask_root": mask_root,
             "workspace": workspace,
             "taxonomy_path": taxonomy_path,
+            "taxonomy": taxonomy,
             "foreground_values": foreground_values,
         }
 
@@ -1274,6 +1295,11 @@ class MainWindow(QMainWindow):
             f"成功配对：{len(data['samples'])}    警告：{len(data['warnings'])}",
             f"抽样检查：{inspection['checked']} 对    Mask值：{value_text}",
             f"抽样尺寸不一致：{inspection['size_mismatches']}    读取错误：{inspection['read_errors']}",
+            (
+                f"场景模式：已加载体系（{len(data['taxonomy'].scenes)} 个场景）"
+                if data["taxonomy"].scenes
+                else "场景模式：数据集自定义场景（未使用场景体系 JSON）"
+            ),
         ]
         configured_values = data["foreground_values"]
         if values and not (configured_values & set(values)):
@@ -1325,6 +1351,7 @@ class MainWindow(QMainWindow):
             mask_root = data["mask_root"]
             workspace = data["workspace"]
             taxonomy_path = data["taxonomy_path"]
+            taxonomy = data["taxonomy"]
             foreground_values = data["foreground_values"]
             dataset_name = config["dataset_name"]
 
@@ -1345,7 +1372,8 @@ class MainWindow(QMainWindow):
                 return
 
             self.taxonomy_path = taxonomy_path
-            self.taxonomy = Taxonomy(taxonomy_path)
+            self.taxonomy = taxonomy
+            self.refresh_taxonomy_controls()
             self.mask_foreground_values = foreground_values
             workspace.mkdir(parents=True, exist_ok=True)
             (workspace / "exports").mkdir(exist_ok=True)
@@ -1381,14 +1409,30 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "无法打开", "数据库中没有数据集。")
             return
         row = self.db.latest_dataset()
+        self.taxonomy_path = None
+        self.taxonomy = Taxonomy()
         if row and row["config_json"]:
             config = json.loads(row["config_json"])
-            taxonomy_path = config.get("taxonomy_path") or self.taxonomy_edit.text()
-            if Path(taxonomy_path).exists():
-                self.taxonomy = Taxonomy(Path(taxonomy_path))
+            configured_taxonomy = str(config.get("taxonomy_path") or "").strip()
+            selected_taxonomy = self.taxonomy_edit.text().strip()
+            for candidate_text in (configured_taxonomy, selected_taxonomy):
+                if not candidate_text:
+                    continue
+                candidate = Path(candidate_text)
+                if not candidate.is_file():
+                    continue
+                try:
+                    loaded_taxonomy = Taxonomy(candidate)
+                except (OSError, UnicodeError, json.JSONDecodeError):
+                    continue
+                if loaded_taxonomy.scenes:
+                    self.taxonomy_path = candidate
+                    self.taxonomy = loaded_taxonomy
+                    break
             mask_config = config.get("mask", {})
             values = mask_config.get("foreground_values")
             self.mask_foreground_values = {int(value) for value in values} if values else None
+        self.refresh_taxonomy_controls()
         self.load_review_page()
 
     def load_review_page(self) -> None:
@@ -1425,15 +1469,27 @@ class MainWindow(QMainWindow):
         self.loading = True
         for button in self.quality_group.buttons():
             button.setChecked(button.text() == review.quality_status)
-        source = review.scene_source if review.scene_source in SCENE_SOURCES else "taxonomy"
+        has_saved_scene = bool(review.primary_level2_scene or review.custom_scene_name_en)
+        source = review.scene_source if review.scene_source in SCENE_SOURCES else self.default_scene_source()
+        if not has_saved_scene and review.scene_status == "unassigned":
+            source = self.default_scene_source()
         self.scene_source_combo.setCurrentText(source)
         if review.level1_id:
             idx = self.domain_combo.findData(review.level1_id)
+            if idx < 0 and source == "taxonomy":
+                self.domain_combo.addItem(
+                    f"{review.level1_id} {review.level1_name}".strip(),
+                    review.level1_id,
+                )
+                idx = self.domain_combo.count() - 1
             if idx >= 0:
                 self.domain_combo.setCurrentIndex(idx)
         self.reload_scene_combo()
         if review.primary_level2_scene:
             idx = self.scene_combo.findText(review.primary_level2_scene)
+            if idx < 0 and source == "taxonomy":
+                self.scene_combo.addItem(review.primary_level2_scene)
+                idx = self.scene_combo.count() - 1
             if idx >= 0:
                 self.scene_combo.setCurrentIndex(idx)
         self.custom_en_edit.setText(review.custom_scene_name_en)
@@ -1471,13 +1527,44 @@ class MainWindow(QMainWindow):
         for scene in self.taxonomy.by_domain.get(domain_id, []):
             self.scene_combo.addItem(scene.scene)
 
+    def default_scene_source(self) -> str:
+        return "taxonomy" if self.taxonomy.scenes else "dataset_custom"
+
+    def refresh_taxonomy_controls(self) -> None:
+        if not hasattr(self, "domain_combo"):
+            return
+        self.domain_combo.blockSignals(True)
+        self.domain_combo.clear()
+        for domain_id, name_zh, name_en in self.taxonomy.domains:
+            self.domain_combo.addItem(f"{domain_id} {name_zh} / {name_en}", domain_id)
+        self.domain_combo.blockSignals(False)
+        taxonomy_available = bool(self.taxonomy.scenes)
+        model = self.scene_source_combo.model()
+        taxonomy_index = self.scene_source_combo.findText("taxonomy")
+        if taxonomy_index >= 0 and hasattr(model, "item"):
+            taxonomy_item = model.item(taxonomy_index)
+            if taxonomy_item is not None:
+                taxonomy_item.setEnabled(taxonomy_available)
+        self.reset_taxonomy_btn.setEnabled(taxonomy_available)
+        source = self.default_scene_source()
+        self.scene_source_combo.setCurrentText(source)
+        self.reload_scene_combo()
+        self.on_scene_source_changed(source)
+        if taxonomy_available:
+            self.scene_hint_label.setText("已加载场景体系，可选正式场景，也可切换为自定义场景。")
+        else:
+            self.scene_hint_label.setText("未加载场景体系，请使用数据集自定义场景。")
+
     def on_scene_source_changed(self, source: str) -> None:
         is_taxonomy = source == "taxonomy"
-        self.domain_combo.setEnabled(is_taxonomy)
-        self.scene_combo.setEnabled(is_taxonomy)
+        taxonomy_editable = is_taxonomy and bool(self.taxonomy.scenes)
+        self.domain_combo.setEnabled(taxonomy_editable)
+        self.scene_combo.setEnabled(taxonomy_editable)
         self.custom_en_edit.setEnabled(not is_taxonomy)
         self.custom_zh_edit.setEnabled(not is_taxonomy)
         self.mapping_edit.setEnabled(not is_taxonomy)
+        if is_taxonomy and not self.taxonomy.scenes:
+            self.scene_hint_label.setText("当前项目没有可用的场景体系；已有体系场景仅供查看。")
 
     def checked_quality_status(self) -> str:
         quality = "unreviewed"
@@ -1549,6 +1636,9 @@ class MainWindow(QMainWindow):
         self.scene_hint_label.setText("场景已确认并保存。")
 
     def reset_to_taxonomy_scene(self) -> None:
+        if not self.taxonomy.scenes:
+            QMessageBox.information(self, "未加载场景体系", "当前项目没有可用的场景体系 JSON，请使用自定义场景。")
+            return
         self.scene_source_combo.setCurrentText("taxonomy")
         self.scene_combo.setCurrentIndex(0)
         self.custom_en_edit.clear()
@@ -1558,7 +1648,7 @@ class MainWindow(QMainWindow):
         self.scene_hint_label.setText("已切换为正式体系选择，选好后点击确认场景。")
 
     def clear_scene_selection(self) -> None:
-        self.scene_source_combo.setCurrentText("taxonomy")
+        self.scene_source_combo.setCurrentText(self.default_scene_source())
         self.scene_combo.setCurrentIndex(0)
         self.custom_en_edit.clear()
         self.custom_zh_edit.clear()
@@ -1600,6 +1690,13 @@ class MainWindow(QMainWindow):
     def apply_common_scene(self, item: QListWidgetItem) -> None:
         data = item.data(Qt.ItemDataRole.UserRole)
         if not isinstance(data, dict):
+            return
+        if data.get("scene_source") == "taxonomy" and not self.taxonomy.scenes:
+            QMessageBox.information(
+                self,
+                "场景体系不可用",
+                "该记录来自场景体系，但当前未加载对应 JSON。已有记录会保留，不能据此分配新样本。",
+            )
             return
         self.scene_source_combo.setCurrentText(data.get("scene_source", "taxonomy"))
         if data.get("scene_source") == "taxonomy":
