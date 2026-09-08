@@ -1,0 +1,18 @@
+{
+  "dataset_name": "Greenland-512",
+  "image_root": "D:/硕士毕业论文/相关图文数据集/自有数据集/greenland_3968x3968_test512",
+  "mask_root": "D:/硕士毕业论文/相关图文数据集/自有数据集/greenland_3968x3968_test512",
+  "taxonomy_path": "D:/硕士毕业论文/ppt相关/geo_scene_taxonomy_1.0.json",
+  "pairing": {
+    "mode": "voc_segmentation",
+    "image_dir_name": "JPEGImages",
+    "mask_dir_name": "SegmentationClass",
+    "split": "all"
+  },
+  "mask": {
+    "type": "binary",
+    "background_value": 0,
+    "foreground_values": [1],
+    "foreground_name": "green space"
+  }
+}

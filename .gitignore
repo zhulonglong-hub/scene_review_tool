@@ -1,0 +1,14 @@
+output/
+workspaces/
+
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+*.py[cod]
+*.log
+.env
+.env.*
