@@ -2,7 +2,16 @@ from pathlib import Path
 
 from PIL import Image
 
-from scene_review_tool.app import Review, ReviewDatabase, Sample, Taxonomy, compose_preview, scan_dataset
+from scene_review_tool.app import (
+    Review,
+    ReviewDatabase,
+    Sample,
+    Taxonomy,
+    build_export_plan,
+    compose_preview,
+    export_review_items,
+    scan_dataset,
+)
 
 
 def test_taxonomy_loads_project_taxonomy():
@@ -131,3 +140,72 @@ def test_common_scene_count_is_assigned_sample_count(tmp_path):
     assert common[0]["scene_name_en"] == "river"
     assert common[0]["assigned_count"] == 1
     db.close()
+
+
+def test_export_plan_separates_quality_and_scene_exports():
+    items = [
+        (Sample("a", "a.png", "a-mask.png", "g"), Review(quality_status="accepted")),
+        (
+            Sample("b", "b.png", "b-mask.png", "g"),
+            Review(quality_status="accepted", scene_status="assigned", primary_level2_scene="river"),
+        ),
+        (
+            Sample("c", "c.png", "c-mask.png", "g"),
+            Review(quality_status="accepted", scene_status="uncertain", primary_level2_scene="lake"),
+        ),
+        (
+            Sample("d", "d.png", "d-mask.png", "g"),
+            Review(quality_status="rejected", scene_status="assigned", primary_level2_scene="river"),
+        ),
+        (
+            Sample("e", "e.png", "e-mask.png", "g"),
+            Review(quality_status="accepted", scene_status="assigned"),
+        ),
+    ]
+
+    quality_plan = build_export_plan(items, group_by_scene=False)
+    scene_plan = build_export_plan(items, group_by_scene=True)
+
+    assert [sample.id for sample, _ in quality_plan.items] == ["a", "b", "c", "e"]
+    assert [sample.id for sample, _ in scene_plan.items] == ["b"]
+    assert scene_plan.accepted_total == 4
+    assert scene_plan.assigned_total == 1
+    assert scene_plan.unassigned_total == 1
+    assert scene_plan.uncertain_total == 1
+    assert scene_plan.invalid_assigned_total == 1
+
+
+def test_export_review_items_writes_status_manifest_and_expected_layout(tmp_path):
+    image_path = tmp_path / "source.jpg"
+    mask_path = tmp_path / "source.png"
+    Image.new("RGB", (2, 2), (10, 20, 30)).save(image_path)
+    Image.new("L", (2, 2), 1).save(mask_path)
+    sample = Sample("sample-id", str(image_path), str(mask_path), "g")
+    review = Review(quality_status="accepted", scene_status="assigned", primary_level2_scene="river")
+    plan = build_export_plan([(sample, review)], group_by_scene=True)
+    root = tmp_path / "export"
+
+    exported = export_review_items(plan, root, group_by_scene=True)
+
+    assert exported == 1
+    assert (root / "river" / "images" / "sample-id_source.jpg").is_file()
+    assert (root / "river" / "masks" / "sample-id_source.png").is_file()
+    manifest = (root / "export_manifest.csv").read_text(encoding="utf-8-sig")
+    assert "quality_status,scene_status,scene" in manifest
+    assert "accepted,assigned,river" in manifest
+
+
+def test_quality_export_copies_accepted_sample_without_scene(tmp_path):
+    image_path = tmp_path / "quality-source.jpg"
+    mask_path = tmp_path / "quality-source.png"
+    Image.new("RGB", (2, 2), (10, 20, 30)).save(image_path)
+    Image.new("L", (2, 2), 1).save(mask_path)
+    sample = Sample("quality-id", str(image_path), str(mask_path), "g")
+    plan = build_export_plan([(sample, Review(quality_status="accepted"))], group_by_scene=False)
+    root = tmp_path / "quality-export"
+
+    exported = export_review_items(plan, root, group_by_scene=False)
+
+    assert exported == 1
+    assert (root / "images" / "quality-id_quality-source.jpg").is_file()
+    assert (root / "masks" / "quality-id_quality-source.png").is_file()

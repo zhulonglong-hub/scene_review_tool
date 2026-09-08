@@ -83,6 +83,84 @@ class Review:
     reviewer_note: str = ""
 
 
+@dataclass(frozen=True)
+class ExportPlan:
+    items: tuple[tuple[Sample, Review], ...]
+    accepted_total: int
+    assigned_total: int
+    unassigned_total: int
+    uncertain_total: int
+    invalid_assigned_total: int
+
+
+def review_scene_name(review: Review) -> str:
+    return review.primary_level2_scene or review.custom_scene_name_en
+
+
+def build_export_plan(items: list[tuple[Sample, Review]], group_by_scene: bool) -> ExportPlan:
+    accepted = [(sample, review) for sample, review in items if review.quality_status == "accepted"]
+    assigned = [
+        (sample, review)
+        for sample, review in accepted
+        if review.scene_status == "assigned" and bool(review_scene_name(review))
+    ]
+    return ExportPlan(
+        items=tuple(assigned if group_by_scene else accepted),
+        accepted_total=len(accepted),
+        assigned_total=len(assigned),
+        unassigned_total=sum(review.scene_status == "unassigned" for _, review in accepted),
+        uncertain_total=sum(review.scene_status == "uncertain" for _, review in accepted),
+        invalid_assigned_total=sum(
+            review.scene_status == "assigned" and not review_scene_name(review) for _, review in accepted
+        ),
+    )
+
+
+def export_review_items(plan: ExportPlan, root: Path, group_by_scene: bool) -> int:
+    root.mkdir(parents=True, exist_ok=False)
+    rows: list[list[str]] = []
+    for sample, review in plan.items:
+        scene = review_scene_name(review)
+        export_root = root
+        if group_by_scene:
+            safe_scene = "".join(c if c.isalnum() or c in " ._-" else "_" for c in scene).strip() or "_unassigned"
+            export_root = root / safe_scene
+        image_dir = export_root / "images"
+        mask_dir = export_root / "masks"
+        image_dir.mkdir(parents=True, exist_ok=True)
+        mask_dir.mkdir(parents=True, exist_ok=True)
+        image_dst = image_dir / f"{sample.id}_{Path(sample.image_path).name}"
+        mask_dst = mask_dir / f"{sample.id}_{Path(sample.mask_path).name}"
+        shutil.copy2(sample.image_path, image_dst)
+        shutil.copy2(sample.mask_path, mask_dst)
+        rows.append([
+            sample.id,
+            review.quality_status,
+            review.scene_status,
+            scene,
+            review.scene_source,
+            sample.image_path,
+            sample.mask_path,
+            str(image_dst),
+            str(mask_dst),
+        ])
+    with (root / "export_manifest.csv").open("w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "sample_id",
+            "quality_status",
+            "scene_status",
+            "scene",
+            "scene_source",
+            "source_image",
+            "source_mask",
+            "export_image",
+            "export_mask",
+        ])
+        writer.writerows(rows)
+    return len(rows)
+
+
 def now_text() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S")
 
@@ -922,6 +1000,8 @@ class MainWindow(QMainWindow):
         self.filter_combo.currentTextChanged.connect(self.reload_samples)
         stats_btn = QPushButton("导出统计")
         stats_btn.clicked.connect(self.export_stats)
+        accepted_export_btn = QPushButton("导出合格数据")
+        accepted_export_btn.clicked.connect(self.export_accepted)
         export_btn = QPushButton("按场景导出")
         export_btn.clicked.connect(self.export_by_scene)
         back_btn = QPushButton("项目页")
@@ -930,6 +1010,7 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(self.search_edit, 2)
         toolbar.addWidget(self.filter_combo)
         toolbar.addWidget(stats_btn)
+        toolbar.addWidget(accepted_export_btn)
         toolbar.addWidget(export_btn)
         toolbar.addWidget(back_btn)
         root.addLayout(toolbar)
@@ -1578,46 +1659,71 @@ class MainWindow(QMainWindow):
             writer.writerow(["total", stats["total"]])
             for key, value in stats["quality"].items():
                 writer.writerow([key, value])
+            plan = build_export_plan(self.db.samples(self.dataset_id, "all", ""), True)
+            writer.writerow(["accepted_with_assigned_scene", plan.assigned_total])
+            writer.writerow(["accepted_with_unassigned_scene", plan.unassigned_total])
+            writer.writerow(["accepted_with_uncertain_scene", plan.uncertain_total])
+            writer.writerow(["accepted_with_invalid_assigned_scene", plan.invalid_assigned_total])
         with scene_path.open("w", encoding="utf-8-sig", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(["scene", "source", "count"])
             writer.writerows(stats["scenes"])
         QMessageBox.information(self, "导出完成", f"已导出：\n{summary_path}\n{scene_path}")
 
+    def export_accepted(self) -> None:
+        self._export_review_data(group_by_scene=False)
+
     def export_by_scene(self) -> None:
+        self._export_review_data(group_by_scene=True)
+
+    def _export_review_data(self, group_by_scene: bool) -> None:
         if not self.db or self.dataset_id is None:
             return
-        out_dir = QFileDialog.getExistingDirectory(self, "选择场景导出目录", "D:/硕士毕业论文/scene_review_tool")
+        self.save_current_review()
+        plan = build_export_plan(self.db.samples(self.dataset_id, "all", ""), group_by_scene)
+        if not plan.items:
+            detail = "当前没有质量状态为 accepted 的样本。"
+            if group_by_scene and plan.accepted_total:
+                detail = "存在 accepted 样本，但没有同时满足“场景已确认且场景名有效”的样本。"
+            QMessageBox.information(self, "没有可导出的样本", detail)
+            return
+        if group_by_scene:
+            prompt = (
+                f"质量合格：{plan.accepted_total} 张\n"
+                f"场景已确认：{plan.assigned_total} 张\n"
+                f"场景未分配：{plan.unassigned_total} 张\n"
+                f"场景不确定：{plan.uncertain_total} 张\n"
+                f"场景状态异常：{plan.invalid_assigned_total} 张\n\n"
+                f"本次将按场景导出 {len(plan.items)} 张，是否继续？"
+            )
+            dialog_title = "确认按场景导出"
+            directory_title = "选择场景导出目录"
+            directory_prefix = "export_by_scene"
+        else:
+            prompt = f"本次将导出全部 {plan.accepted_total} 张质量合格样本，不限制场景状态。是否继续？"
+            dialog_title = "确认导出合格数据"
+            directory_title = "选择合格数据导出目录"
+            directory_prefix = "export_accepted"
+        answer = QMessageBox.question(
+            self,
+            dialog_title,
+            prompt,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        out_dir = QFileDialog.getExistingDirectory(self, directory_title, "D:/硕士毕业论文/scene_review_tool")
         if not out_dir:
             return
-        root = Path(out_dir) / f"export_{time.strftime('%Y%m%d_%H%M%S')}"
-        root.mkdir(parents=True, exist_ok=True)
-        exported = 0
-        rows: list[list[str]] = []
-        for sample, review in self.db.samples(self.dataset_id, "all", ""):
-            if review.quality_status != "accepted":
-                continue
-            scene = review.primary_level2_scene or review.custom_scene_name_en
-            if not scene:
-                continue
-            safe_scene = "".join(c if c.isalnum() or c in " ._-" else "_" for c in scene).strip() or "_unassigned"
-            scene_dir = root / safe_scene
-            image_dir = scene_dir / "images"
-            mask_dir = scene_dir / "masks"
-            image_dir.mkdir(parents=True, exist_ok=True)
-            mask_dir.mkdir(parents=True, exist_ok=True)
-            prefix = sample.id
-            image_dst = image_dir / f"{prefix}_{Path(sample.image_path).name}"
-            mask_dst = mask_dir / f"{prefix}_{Path(sample.mask_path).name}"
-            shutil.copy2(sample.image_path, image_dst)
-            shutil.copy2(sample.mask_path, mask_dst)
-            rows.append([sample.id, scene, review.scene_source, sample.image_path, sample.mask_path, str(image_dst), str(mask_dst)])
-            exported += 1
-        with (root / "export_manifest.csv").open("w", encoding="utf-8-sig", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(["sample_id", "scene", "scene_source", "source_image", "source_mask", "export_image", "export_mask"])
-            writer.writerows(rows)
-        QMessageBox.information(self, "导出完成", f"已导出 {exported} 个 accepted 且已分场景样本到：\n{root}")
+        root = Path(out_dir) / f"{directory_prefix}_{time.strftime('%Y%m%d_%H%M%S')}"
+        try:
+            exported = export_review_items(plan, root, group_by_scene)
+        except OSError as exc:
+            QMessageBox.critical(self, "导出失败", f"导出过程中发生文件错误：\n{exc}")
+            return
+        description = "质量合格样本" if not group_by_scene else "质量合格且场景已确认样本"
+        QMessageBox.information(self, "导出完成", f"已导出 {exported} 个{description}到：\n{root}")
 
     def keyPressEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         key = event.key()
