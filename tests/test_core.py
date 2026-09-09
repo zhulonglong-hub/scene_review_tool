@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import pytest
 from PIL import Image
 
 from scene_review_tool.app import (
@@ -9,8 +10,12 @@ from scene_review_tool.app import (
     Taxonomy,
     build_export_plan,
     compose_preview,
+    compose_preview_layers,
     export_review_items,
+    infer_mask_schema,
+    inspect_sample_pairs,
     scan_dataset,
+    validate_mask_schema,
 )
 
 
@@ -132,6 +137,107 @@ def test_binary_mask_value_one_is_rendered_as_foreground(tmp_path):
 
     assert preview.getpixel((0, 0)) == (10, 20, 30)
     assert preview.getpixel((1, 0)) != (10, 20, 30)
+
+
+def test_grayscale_multiclass_mask_is_detected_and_background_is_suggested(tmp_path):
+    image_path = tmp_path / "image.png"
+    mask_path = tmp_path / "mask.png"
+    Image.new("RGB", (3, 1), (10, 20, 30)).save(image_path)
+    mask = Image.new("L", (3, 1))
+    mask.putdata([0, 1, 2])
+    mask.save(mask_path)
+    sample = Sample("gray", str(image_path), str(mask_path), "g")
+
+    inspection = inspect_sample_pairs([sample])
+    schema = infer_mask_schema(inspection)
+
+    assert inspection["mask_encoding"] == "indexed"
+    assert {label["key"] for label in inspection["mask_labels"]} == {"i:0", "i:1", "i:2"}
+    assert next(label for label in schema["labels"] if label["key"] == "i:0")["role"] == "background"
+    assert {label["name"] for label in schema["labels"] if label["role"] == "class"} == {
+        "class_1",
+        "class_2",
+    }
+
+
+def test_palette_mask_preserves_palette_indices(tmp_path):
+    image_path = tmp_path / "image.png"
+    mask_path = tmp_path / "palette.png"
+    Image.new("RGB", (2, 1), (10, 20, 30)).save(image_path)
+    mask = Image.new("P", (2, 1))
+    palette = [0] * 768
+    palette[3:6] = [0, 255, 0]
+    mask.putpalette(palette)
+    mask.putdata([0, 1])
+    mask.save(mask_path)
+
+    inspection = inspect_sample_pairs([Sample("palette", str(image_path), str(mask_path), "g")])
+
+    assert inspection["mask_encoding"] == "indexed"
+    assert {label["key"] for label in inspection["mask_labels"]} == {"i:0", "i:1"}
+    assert next(label for label in inspection["mask_labels"] if label["key"] == "i:1")["color"] == "#00ff00"
+
+
+def test_rgb_mask_keeps_full_color_labels_and_renders_each_class(tmp_path):
+    image_path = tmp_path / "image.png"
+    mask_path = tmp_path / "rgb-mask.png"
+    Image.new("RGB", (3, 1), (20, 20, 20)).save(image_path)
+    mask = Image.new("RGB", (3, 1))
+    mask.putdata([(0, 0, 0), (0, 255, 0), (0, 0, 255)])
+    mask.save(mask_path)
+    sample = Sample("rgb", str(image_path), str(mask_path), "g")
+
+    inspection = inspect_sample_pairs([sample])
+    schema = infer_mask_schema(inspection)
+    preview = compose_preview(str(image_path), str(mask_path), True, 80, None, schema).convert("RGB")
+
+    assert inspection["mask_encoding"] == "rgb"
+    assert {label["key"] for label in inspection["mask_labels"]} == {
+        "rgb:0,0,0",
+        "rgb:0,255,0",
+        "rgb:0,0,255",
+    }
+    assert preview.getpixel((0, 0)) == (20, 20, 20)
+    assert preview.getpixel((1, 0)) != preview.getpixel((2, 0))
+
+
+def test_rgb_full_classification_mask_does_not_require_background(tmp_path):
+    image_path = tmp_path / "image.png"
+    mask_path = tmp_path / "rgb-mask.png"
+    Image.new("RGB", (2, 1), (20, 20, 20)).save(image_path)
+    mask = Image.new("RGB", (2, 1))
+    mask.putdata([(0, 0, 0), (255, 0, 0)])
+    mask.save(mask_path)
+    schema = {
+        "schema_version": 3,
+        "encoding": "rgb",
+        "background_mode": "none",
+        "labels": [
+            {"key": "rgb:0,0,0", "value": [0, 0, 0], "role": "class", "name": "water", "color": "#0000ff"},
+            {"key": "rgb:255,0,0", "value": [255, 0, 0], "role": "class", "name": "building", "color": "#ff0000"},
+        ],
+    }
+
+    validate_mask_schema(schema)
+    _image, overlay = compose_preview_layers(str(image_path), str(mask_path), None, schema)
+
+    assert overlay.getpixel((0, 0))[3] == 255
+    assert overlay.getpixel((1, 0))[3] == 255
+    assert overlay.getpixel((0, 0)) != overlay.getpixel((1, 0))
+
+
+def test_mask_schema_requires_at_least_one_effective_class():
+    schema = {
+        "schema_version": 3,
+        "encoding": "indexed",
+        "background_mode": "explicit",
+        "labels": [
+            {"key": "i:0", "value": 0, "role": "background", "name": "background", "color": "#000000"}
+        ],
+    }
+
+    with pytest.raises(ValueError, match="至少指定一个有效类别"):
+        validate_mask_schema(schema)
 
 
 def test_database_persists_samples(tmp_path):

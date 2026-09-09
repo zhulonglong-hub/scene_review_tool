@@ -7,13 +7,15 @@ import shutil
 import sqlite3
 import sys
 import time
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 from PIL import Image
-from PySide6.QtCore import Qt, QSize
-from PySide6.QtGui import QImage, QPixmap
+from PySide6.QtCore import QObject, QRunnable, QThreadPool, Qt, Signal, Slot
+from PySide6.QtGui import QColor, QImage, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -22,8 +24,11 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QFrame,
+    QGraphicsScene,
+    QGraphicsView,
     QGridLayout,
     QGroupBox,
+    QHeaderView,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -33,11 +38,14 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QRadioButton,
-    QScrollArea,
     QSlider,
     QSplitter,
     QStackedWidget,
+    QTableWidget,
+    QTableWidgetItem,
     QTextEdit,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -729,9 +737,139 @@ def supported_files(root: Path, extensions: set[str], recursive: bool = True) ->
     return sorted(path for path in iterator if path.is_file() and path.suffix.lower() in extensions)
 
 
-def inspect_sample_pairs(samples: list[Sample], limit: int = 24) -> dict[str, Any]:
+LABEL_COLORS = (
+    "#00d7ff",
+    "#ffb000",
+    "#7dde92",
+    "#ff6b8a",
+    "#a78bfa",
+    "#f97316",
+    "#22c55e",
+    "#38bdf8",
+)
+INDEXED_MASK_MODES = {"1", "L", "P", "I", "I;16", "I;16B", "I;16L"}
+
+
+def mask_encoding(mask: Image.Image) -> str:
+    return "indexed" if mask.mode in INDEXED_MASK_MODES else "rgb"
+
+
+def mask_label_key(encoding: str, value: int | tuple[int, int, int]) -> str:
+    if encoding == "indexed":
+        return f"i:{int(value)}"
+    red, green, blue = value
+    return f"rgb:{red},{green},{blue}"
+
+
+def mask_label_text(value: int | list[int] | tuple[int, int, int]) -> str:
+    if isinstance(value, int):
+        return str(value)
+    return f"({', '.join(str(int(channel)) for channel in value)})"
+
+
+def default_label_color(
+    encoding: str,
+    value: int | tuple[int, int, int],
+    palette: list[int] | None = None,
+) -> str:
+    if encoding == "rgb":
+        red, green, blue = value
+        return f"#{red:02x}{green:02x}{blue:02x}"
+    index = int(value)
+    if palette and 0 <= index * 3 + 2 < len(palette):
+        red, green, blue = palette[index * 3:index * 3 + 3]
+        return f"#{red:02x}{green:02x}{blue:02x}"
+    if index == 0:
+        return "#000000"
+    digest = int(hashlib.sha1(str(index).encode("ascii")).hexdigest()[:8], 16)
+    return LABEL_COLORS[digest % len(LABEL_COLORS)]
+
+
+def _edge_label_counts(mask: Image.Image, encoding: str) -> Counter[str]:
+    source = mask if encoding == "indexed" else mask.convert("RGB")
+    array = np.asarray(source)
+    if array.ndim == 2:
+        edge = np.concatenate((array[0, :], array[-1, :], array[:, 0], array[:, -1]))
+        values, counts = np.unique(edge, return_counts=True)
+        return Counter({mask_label_key(encoding, int(value)): int(count) for value, count in zip(values, counts)})
+    edge = np.concatenate((array[0, :, :3], array[-1, :, :3], array[:, 0, :3], array[:, -1, :3]))
+    values, counts = np.unique(edge.reshape(-1, 3), axis=0, return_counts=True)
+    return Counter(
+        {
+            mask_label_key(encoding, tuple(int(channel) for channel in value)): int(count)
+            for value, count in zip(values, counts)
+        }
+    )
+
+
+def infer_mask_schema(inspection: dict[str, Any], default_foreground_name: str = "") -> dict[str, Any]:
+    detected_labels = inspection.get("mask_labels", [])
+    if not detected_labels:
+        return {"schema_version": 3, "encoding": inspection.get("mask_encoding", "unknown"), "background_mode": "none", "labels": []}
+    by_key = {label["key"]: label for label in detected_labels}
+    preferred_backgrounds = ("i:0", "rgb:0,0,0")
+    background_key = next((key for key in preferred_backgrounds if key in by_key), "")
+    if not background_key:
+        background_key = max(
+            detected_labels,
+            key=lambda label: (label.get("border_count", 0), label.get("pixel_count", 0)),
+        )["key"]
+    class_count = len(detected_labels) - 1
+    labels: list[dict[str, Any]] = []
+    for label in detected_labels:
+        role = "background" if label["key"] == background_key else "class"
+        if role == "background":
+            name = "background"
+        elif class_count == 1 and default_foreground_name.strip():
+            name = default_foreground_name.strip()
+        elif class_count == 1:
+            name = "foreground"
+        else:
+            safe_value = mask_label_text(label["value"]).replace("(", "").replace(")", "").replace(", ", "_")
+            name = f"class_{safe_value}"
+        labels.append(
+            {
+                "key": label["key"],
+                "value": label["value"],
+                "role": role,
+                "name": name,
+                "color": label["color"],
+            }
+        )
+    return {
+        "schema_version": 3,
+        "encoding": inspection.get("mask_encoding", "unknown"),
+        "background_mode": "explicit",
+        "labels": labels,
+    }
+
+
+def validate_mask_schema(schema: dict[str, Any]) -> None:
+    labels = schema.get("labels", [])
+    if not labels:
+        raise ValueError("Mask 类别映射为空。")
+    if any(label.get("role") not in {"background", "class", "ignore"} for label in labels):
+        raise ValueError("Mask 类别映射中存在无效角色。")
+    classes = [label for label in labels if label.get("role") == "class"]
+    if not classes:
+        raise ValueError("请在 Mask 类别映射中至少指定一个有效类别。")
+    for label in classes:
+        if not str(label.get("name") or "").strip():
+            raise ValueError(f"请为标签 {mask_label_text(label['value'])} 填写类别名称。")
+
+
+def inspect_sample_pairs(samples: list[Sample], limit: int = 64) -> dict[str, Any]:
     if not samples:
-        return {"checked": 0, "mask_values": [], "size_mismatches": 0, "read_errors": 0}
+        return {
+            "checked": 0,
+            "mask_values": [],
+            "mask_labels": [],
+            "mask_encoding": "unknown",
+            "mask_modes": [],
+            "label_overflow": 0,
+            "size_mismatches": 0,
+            "read_errors": 0,
+        }
     count = min(limit, len(samples))
     if count == 1:
         selected = [samples[0]]
@@ -739,7 +877,11 @@ def inspect_sample_pairs(samples: list[Sample], limit: int = 24) -> dict[str, An
         indices = {round(index * (len(samples) - 1) / (count - 1)) for index in range(count)}
         selected = [samples[index] for index in sorted(indices)]
 
-    values: set[int] = set()
+    labels: dict[str, dict[str, Any]] = {}
+    encodings: set[str] = set()
+    modes: set[str] = set()
+    border_counts: Counter[str] = Counter()
+    label_overflow = 0
     size_mismatches = 0
     read_errors = 0
     for sample in selected:
@@ -747,18 +889,50 @@ def inspect_sample_pairs(samples: list[Sample], limit: int = 24) -> dict[str, An
             with Image.open(sample.image_path) as image, Image.open(sample.mask_path) as mask:
                 if image.size != mask.size:
                     size_mismatches += 1
-                colors = mask.getcolors(maxcolors=4096)
+                encoding = mask_encoding(mask)
+                encodings.add(encoding)
+                modes.add(mask.mode)
+                palette = mask.getpalette() if mask.mode == "P" else None
+                source = mask if encoding == "indexed" else mask.convert("RGB")
+                colors = source.getcolors(maxcolors=4096)
                 if colors is not None:
-                    for _count, value in colors:
-                        if isinstance(value, int):
-                            values.add(value)
-                        elif isinstance(value, tuple) and value:
-                            values.add(int(value[0]))
+                    seen_in_sample: set[str] = set()
+                    for pixel_count, raw_value in colors:
+                        if encoding == "indexed":
+                            value: int | tuple[int, int, int] = int(raw_value)
+                        else:
+                            value = tuple(int(channel) for channel in raw_value[:3])
+                        key = mask_label_key(encoding, value)
+                        if key not in labels:
+                            labels[key] = {
+                                "key": key,
+                                "value": value,
+                                "color": default_label_color(encoding, value, palette),
+                                "pixel_count": 0,
+                                "sample_count": 0,
+                            }
+                        labels[key]["pixel_count"] += int(pixel_count)
+                        seen_in_sample.add(key)
+                    for key in seen_in_sample:
+                        labels[key]["sample_count"] += 1
+                else:
+                    label_overflow += 1
+                border_counts.update(_edge_label_counts(mask, encoding))
         except Exception:
             read_errors += 1
+    for key, label in labels.items():
+        label["border_count"] = border_counts[key]
+    ordered_labels = sorted(labels.values(), key=lambda label: (-label["pixel_count"], label["key"]))
+    indexed_values = sorted(
+        int(label["value"]) for label in ordered_labels if label["key"].startswith("i:")
+    )
     return {
         "checked": len(selected),
-        "mask_values": sorted(values),
+        "mask_values": indexed_values,
+        "mask_labels": ordered_labels,
+        "mask_encoding": next(iter(encodings)) if len(encodings) == 1 else "mixed",
+        "mask_modes": sorted(modes),
+        "label_overflow": label_overflow,
         "size_mismatches": size_mismatches,
         "read_errors": read_errors,
     }
@@ -774,11 +948,76 @@ def find_mask_with_extensions(path: Path, exts: set[str]) -> Path | None:
     return None
 
 
-def pil_to_qpixmap(image: Image.Image) -> QPixmap:
+def pil_to_qimage(image: Image.Image) -> QImage:
     rgba = image.convert("RGBA")
     data = rgba.tobytes("raw", "RGBA")
     qimage = QImage(data, rgba.width, rgba.height, rgba.width * 4, QImage.Format.Format_RGBA8888)
-    return QPixmap.fromImage(qimage.copy())
+    return qimage.copy()
+
+
+def pil_to_qpixmap(image: Image.Image) -> QPixmap:
+    return QPixmap.fromImage(pil_to_qimage(image))
+
+
+def _label_code(encoding: str, value: int | list[int] | tuple[int, int, int]) -> int:
+    if encoding == "indexed":
+        return int(value)
+    red, green, blue = (int(channel) for channel in value[:3])
+    return (red << 16) | (green << 8) | blue
+
+
+def compose_preview_layers(
+    image_path: str,
+    mask_path: str,
+    foreground_values: set[int] | None = None,
+    mask_schema: dict[str, Any] | None = None,
+    visible_label_keys: set[str] | None = None,
+) -> tuple[Image.Image, Image.Image]:
+    with Image.open(image_path) as source_image:
+        image = source_image.convert("RGB")
+    with Image.open(mask_path) as mask:
+        if mask.size != image.size:
+            raise ValueError(f"image and mask size mismatch: {image.size} vs {mask.size}")
+        overlay_array = np.zeros((image.height, image.width, 4), dtype=np.uint8)
+        if mask_schema and mask_schema.get("labels"):
+            encoding = mask_encoding(mask)
+            source = mask if encoding == "indexed" else mask.convert("RGB")
+            source_array = np.asarray(source)
+            if encoding == "indexed":
+                pixel_codes = source_array.astype(np.uint32, copy=False)
+            else:
+                rgb = source_array[:, :, :3].astype(np.uint32, copy=False)
+                pixel_codes = (rgb[:, :, 0] << 16) | (rgb[:, :, 1] << 8) | rgb[:, :, 2]
+            active_labels = [
+                label
+                for label in mask_schema["labels"]
+                if label.get("role") == "class"
+                and (visible_label_keys is None or label.get("key") in visible_label_keys)
+            ]
+            entries: list[tuple[int, tuple[int, int, int, int]]] = []
+            for label in active_labels:
+                color = str(label.get("color") or "#00d7ff").lstrip("#")
+                try:
+                    channels = tuple(int(color[index:index + 2], 16) for index in (0, 2, 4))
+                    if len(channels) != 3:
+                        raise ValueError
+                except (ValueError, TypeError):
+                    channels = (0, 215, 255)
+                entries.append((_label_code(encoding, label["value"]), (*channels, 255)))
+            if entries:
+                entries.sort(key=lambda entry: entry[0])
+                lookup_codes = np.asarray([entry[0] for entry in entries], dtype=np.uint32)
+                lookup_colors = np.asarray([entry[1] for entry in entries], dtype=np.uint8)
+                flat_codes = pixel_codes.reshape(-1)
+                positions = np.searchsorted(lookup_codes, flat_codes)
+                safe_positions = np.minimum(positions, len(lookup_codes) - 1)
+                matched = (positions < len(lookup_codes)) & (lookup_codes[safe_positions] == flat_codes)
+                overlay_array.reshape(-1, 4)[matched] = lookup_colors[safe_positions[matched]]
+        else:
+            grayscale = np.asarray(mask.convert("L"))
+            selected = np.isin(grayscale, list(foreground_values)) if foreground_values else grayscale > 0
+            overlay_array[selected] = (0, 215, 255, 255)
+    return image, Image.fromarray(overlay_array)
 
 
 def compose_preview(
@@ -787,72 +1026,149 @@ def compose_preview(
     show_mask: bool,
     opacity: int,
     foreground_values: set[int] | None = None,
+    mask_schema: dict[str, Any] | None = None,
 ) -> Image.Image:
-    image = Image.open(image_path).convert("RGB")
+    image, overlay = compose_preview_layers(
+        image_path, mask_path, foreground_values, mask_schema
+    )
     if not show_mask:
         return image
-    mask = Image.open(mask_path).convert("L")
-    if mask.size != image.size:
-        raise ValueError(f"image and mask size mismatch: {image.size} vs {mask.size}")
-    overlay = Image.new("RGBA", image.size, (0, 215, 255, 0))
-    if foreground_values:
-        alpha = mask.point(lambda value: int(opacity * 2.55) if value in foreground_values else 0)
-    else:
-        alpha = mask.point(lambda value: int(opacity * 2.55) if value > 0 else 0)
-    overlay.putalpha(alpha)
+    alpha_scale = max(0.0, min(1.0, opacity / 100.0))
+    overlay.putalpha(overlay.getchannel("A").point(lambda value: round(value * alpha_scale)))
     return Image.alpha_composite(image.convert("RGBA"), overlay)
 
 
-class ImageCanvas(QScrollArea):
+class PreviewRenderSignals(QObject):
+    finished = Signal(int, str, str, object, object, str)
+
+
+class PreviewRenderTask(QRunnable):
+    def __init__(
+        self,
+        request_id: int,
+        image_path: str,
+        mask_path: str,
+        foreground_values: set[int] | None,
+        mask_schema: dict[str, Any] | None,
+        visible_label_keys: set[str] | None,
+    ) -> None:
+        super().__init__()
+        self.setAutoDelete(False)
+        self.request_id = request_id
+        self.image_path = image_path
+        self.mask_path = mask_path
+        self.foreground_values = foreground_values
+        self.mask_schema = mask_schema
+        self.visible_label_keys = visible_label_keys
+        self.signals = PreviewRenderSignals()
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            image, overlay = compose_preview_layers(
+                self.image_path,
+                self.mask_path,
+                self.foreground_values,
+                self.mask_schema,
+                self.visible_label_keys,
+            )
+            base_qimage = pil_to_qimage(image)
+            overlay_qimage = pil_to_qimage(overlay)
+            error = ""
+        except Exception as exc:
+            base_qimage = QImage()
+            overlay_qimage = QImage()
+            error = str(exc)
+        self.signals.finished.emit(
+            self.request_id,
+            self.image_path,
+            self.mask_path,
+            base_qimage,
+            overlay_qimage,
+            error,
+        )
+
+
+class ImageCanvas(QGraphicsView):
     def __init__(self) -> None:
         super().__init__()
-        self.label = QLabel("No image")
-        self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.label.setMinimumSize(QSize(400, 400))
-        self.setWidget(self.label)
-        self.setWidgetResizable(True)
-        self.original: QPixmap | None = None
-        self.zoom = 1.0
+        self.canvas_scene = QGraphicsScene(self)
+        self.setScene(self.canvas_scene)
+        self.base_item = None
+        self.overlay_item = None
+        self._fit_mode = True
+        self.setMinimumSize(400, 400)
+        self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
+        self.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        self.set_error("No image")
 
     def set_pixmap(self, pixmap: QPixmap) -> None:
-        self.original = pixmap
-        self.zoom = 1.0
-        self._apply_zoom()
+        self.set_layers(pixmap, QPixmap())
+
+    def set_layers(self, base: QPixmap, overlay: QPixmap) -> None:
+        self.canvas_scene.clear()
+        self.base_item = self.canvas_scene.addPixmap(base)
+        self.overlay_item = self.canvas_scene.addPixmap(overlay)
+        self.overlay_item.setZValue(1)
+        self.canvas_scene.setSceneRect(self.base_item.boundingRect())
+        self._fit_mode = True
+        self.fit()
+
+    def set_loading(self) -> None:
+        self._show_message("正在加载图像...")
 
     def set_error(self, text: str) -> None:
-        self.original = None
-        self.label.setPixmap(QPixmap())
-        self.label.setText(text)
+        self._show_message(text)
+
+    def _show_message(self, text: str) -> None:
+        self.canvas_scene.clear()
+        self.base_item = None
+        self.overlay_item = None
+        message = self.canvas_scene.addText(text)
+        message.setDefaultTextColor(QColor("#d7dde3"))
+        self.canvas_scene.setSceneRect(message.boundingRect())
+        self.resetTransform()
+
+    def set_overlay_visible(self, visible: bool) -> None:
+        if self.overlay_item is not None:
+            self.overlay_item.setVisible(visible)
+
+    def set_overlay_opacity(self, opacity: int) -> None:
+        if self.overlay_item is not None:
+            self.overlay_item.setOpacity(max(0.0, min(1.0, opacity / 100.0)))
 
     def wheelEvent(self, event) -> None:  # type: ignore[no-untyped-def]
-        if self.original is None:
+        if self.base_item is None:
             return super().wheelEvent(event)
         if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
-            delta = 1.15 if event.angleDelta().y() > 0 else 0.87
-            self.zoom = min(8.0, max(0.1, self.zoom * delta))
-            self._apply_zoom()
+            factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
+            next_scale = self.transform().m11() * factor
+            if 0.03 <= next_scale <= 20.0:
+                self.scale(factor, factor)
+                self._fit_mode = False
             event.accept()
             return
         super().wheelEvent(event)
 
     def fit(self) -> None:
-        self.zoom = 1.0
-        self._apply_zoom()
-
-    def _apply_zoom(self) -> None:
-        if self.original is None:
+        if self.base_item is None:
             return
-        if self.zoom == 1.0:
-            area = self.viewport().size()
-            scaled = self.original.scaled(area, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
-        else:
-            scaled = self.original.scaled(
-                int(self.original.width() * self.zoom),
-                int(self.original.height() * self.zoom),
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
-        self.label.setPixmap(scaled)
+        self.resetTransform()
+        self.fitInView(self.canvas_scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+        self._fit_mode = True
+
+    def actual_size(self) -> None:
+        if self.base_item is None:
+            return
+        self.resetTransform()
+        self._fit_mode = False
+
+    def resizeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        super().resizeEvent(event)
+        if self._fit_mode:
+            self.fit()
 
 
 class MainWindow(QMainWindow):
@@ -865,6 +1181,12 @@ class MainWindow(QMainWindow):
         self.db: ReviewDatabase | None = None
         self.dataset_id: int | None = None
         self.mask_foreground_values: set[int] | None = {1}
+        self.mask_schema: dict[str, Any] | None = None
+        self.visible_mask_label_keys: set[str] | None = None
+        self.render_request_id = 0
+        self.render_tasks: dict[int, PreviewRenderTask] = {}
+        self.render_pool = QThreadPool(self)
+        self.render_pool.setMaxThreadCount(1)
         self.items: list[tuple[Sample, Review]] = []
         self.current_index = -1
         self.loading = False
@@ -939,7 +1261,7 @@ class MainWindow(QMainWindow):
         self.import_type_combo.currentIndexChanged.connect(self.import_options_stack.setCurrentIndex)
 
         self.mask_values_edit = QLineEdit()
-        self.mask_values_edit.setPlaceholderText("必填；多个标签用英文逗号分隔，例如 1,2")
+        self.mask_values_edit.setPlaceholderText("可选；兼容旧式灰度前景值，例如 1,2")
         self.mask_name_edit = QLineEdit()
         self.mask_name_edit.setPlaceholderText("可选，例如 green space；默认 foreground")
         form.addRow("数据集名称", self.dataset_name_edit)
@@ -947,9 +1269,28 @@ class MainWindow(QMainWindow):
         form.addRow(self.import_options_stack)
         form.addRow("工作区", self._path_row(self.workspace_edit, True))
         form.addRow("场景体系 JSON（可选）", self._path_row(self.taxonomy_edit, False))
-        form.addRow("Mask 前景标签值", self.mask_values_edit)
-        form.addRow("Mask 前景名称", self.mask_name_edit)
+        form.addRow("手动前景值（可选）", self.mask_values_edit)
+        form.addRow("默认前景名称", self.mask_name_edit)
         layout.addWidget(form_box)
+
+        class_box = QGroupBox("Mask 类别映射")
+        class_layout = QVBoxLayout(class_box)
+        class_hint = QLabel(
+            "扫描后自动识别标签。背景只是候选项；全分类 Mask 可将所有有效标签设为 class。"
+        )
+        class_hint.setObjectName("hint")
+        class_hint.setWordWrap(True)
+        self.mask_class_table = QTableWidget(0, 4)
+        self.mask_class_table.setHorizontalHeaderLabels(["颜色", "原始标签", "角色", "类别名称"])
+        header = self.mask_class_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self.mask_class_table.setMinimumHeight(170)
+        class_layout.addWidget(class_hint)
+        class_layout.addWidget(self.mask_class_table)
+        layout.addWidget(class_box)
 
         action_row = QHBoxLayout()
         scan_btn = QPushButton("扫描预览")
@@ -978,6 +1319,58 @@ class MainWindow(QMainWindow):
         layout.addLayout(preview_row)
         layout.addStretch()
         return page
+
+    def populate_mask_class_table(self, schema: dict[str, Any]) -> None:
+        labels = schema.get("labels", [])
+        self.mask_class_table.setRowCount(len(labels))
+        for row, label in enumerate(labels):
+            color = str(label.get("color") or "#00d7ff")
+            color_item = QTableWidgetItem(color)
+            color_item.setBackground(QColor(color))
+            color_item.setFlags(color_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            raw_item = QTableWidgetItem(mask_label_text(label.get("value", "")))
+            raw_item.setData(Qt.ItemDataRole.UserRole, dict(label))
+            raw_item.setFlags(raw_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            role_combo = QComboBox()
+            role_combo.addItems(["background", "class", "ignore"])
+            role_combo.setCurrentText(str(label.get("role") or "class"))
+            name_item = QTableWidgetItem(str(label.get("name") or ""))
+            self.mask_class_table.setItem(row, 0, color_item)
+            self.mask_class_table.setItem(row, 1, raw_item)
+            self.mask_class_table.setCellWidget(row, 2, role_combo)
+            self.mask_class_table.setItem(row, 3, name_item)
+
+    def mask_schema_from_table(self, encoding: str) -> dict[str, Any] | None:
+        if self.mask_class_table.rowCount() == 0:
+            return None
+        labels: list[dict[str, Any]] = []
+        for row in range(self.mask_class_table.rowCount()):
+            raw_item = self.mask_class_table.item(row, 1)
+            role_combo = self.mask_class_table.cellWidget(row, 2)
+            name_item = self.mask_class_table.item(row, 3)
+            if raw_item is None or not isinstance(role_combo, QComboBox):
+                continue
+            label = raw_item.data(Qt.ItemDataRole.UserRole)
+            if not isinstance(label, dict):
+                continue
+            labels.append(
+                {
+                    "key": label["key"],
+                    "value": label["value"],
+                    "role": role_combo.currentText(),
+                    "name": name_item.text().strip() if name_item else "",
+                    "color": label["color"],
+                }
+            )
+        if not labels:
+            return None
+        has_background = any(label["role"] == "background" for label in labels)
+        return {
+            "schema_version": 3,
+            "encoding": encoding,
+            "background_mode": "explicit" if has_background else "none",
+            "labels": labels,
+        }
 
     def _path_row(self, edit: QLineEdit, directory: bool) -> QWidget:
         row = QWidget()
@@ -1036,20 +1429,37 @@ class MainWindow(QMainWindow):
         view_bar = QHBoxLayout()
         self.mask_checkbox = QCheckBox("显示 mask")
         self.mask_checkbox.setChecked(True)
-        self.mask_checkbox.stateChanged.connect(self.refresh_image)
+        self.mask_checkbox.stateChanged.connect(self.update_mask_visibility)
         self.opacity_slider = QSlider(Qt.Orientation.Horizontal)
         self.opacity_slider.setRange(5, 95)
         self.opacity_slider.setValue(45)
-        self.opacity_slider.valueChanged.connect(self.refresh_image)
+        self.opacity_slider.valueChanged.connect(self.update_mask_opacity)
         fit_btn = QPushButton("适合窗口")
         fit_btn.clicked.connect(lambda: self.image_canvas.fit())
+        actual_btn = QPushButton("100%")
+        actual_btn.clicked.connect(lambda: self.image_canvas.actual_size())
         view_bar.addWidget(self.mask_checkbox)
         view_bar.addWidget(QLabel("透明度"))
         view_bar.addWidget(self.opacity_slider)
         view_bar.addWidget(fit_btn)
+        view_bar.addWidget(actual_btn)
         center_layout.addLayout(view_bar)
+
+        image_splitter = QSplitter(Qt.Orientation.Horizontal)
         self.image_canvas = ImageCanvas()
-        center_layout.addWidget(self.image_canvas, 1)
+        image_splitter.addWidget(self.image_canvas)
+        legend_box = QGroupBox("Mask 图例")
+        legend_layout = QVBoxLayout(legend_box)
+        self.mask_legend = QTreeWidget()
+        self.mask_legend.setHeaderLabels(["颜色", "类别名称", "原始标签", "角色"])
+        self.mask_legend.setRootIsDecorated(False)
+        self.mask_legend.setAlternatingRowColors(True)
+        self.mask_legend.itemChanged.connect(self.on_mask_legend_changed)
+        legend_layout.addWidget(self.mask_legend)
+        legend_box.setMinimumWidth(230)
+        image_splitter.addWidget(legend_box)
+        image_splitter.setSizes([760, 240])
+        center_layout.addWidget(image_splitter, 1)
         self.path_label = QLabel("")
         self.path_label.setWordWrap(True)
         center_layout.addWidget(self.path_label)
@@ -1228,15 +1638,13 @@ class MainWindow(QMainWindow):
                 raise ValueError("请检查图像文件夹和Mask文件夹。")
 
         try:
-            foreground_values = {
+            manual_foreground_values = {
                 int(value.strip())
                 for value in self.mask_values_edit.text().split(",")
                 if value.strip()
             }
         except ValueError as exc:
             raise ValueError("Mask前景标签值必须是整数，多个值使用英文逗号分隔。") from exc
-        if not foreground_values:
-            raise ValueError("请至少填写一个Mask前景标签值。")
 
         samples, warnings = scan_dataset(
             dataset_name,
@@ -1250,6 +1658,45 @@ class MainWindow(QMainWindow):
         )
         if not samples:
             raise ValueError("没有找到成功配对的image-mask样本。请检查路径和配对规则。")
+        inspection = inspect_sample_pairs(samples)
+        if not inspection["mask_labels"]:
+            raise ValueError("抽样 Mask 中没有检测到离散标签；请确认标签图不是连续色彩图或压缩图。")
+        if inspection["label_overflow"]:
+            warnings.append(
+                f"{inspection['label_overflow']} 张抽样 Mask 的颜色超过 4096 种，可能不是离散标签图。"
+            )
+
+        schema = infer_mask_schema(inspection, self.mask_name_edit.text())
+        table_schema = self.mask_schema_from_table(inspection["mask_encoding"])
+        detected_keys = {label["key"] for label in inspection["mask_labels"]}
+        if table_schema and {label["key"] for label in table_schema["labels"]} == detected_keys:
+            schema = table_schema
+        if manual_foreground_values and inspection["mask_encoding"] in {"indexed", "mixed"}:
+            for label in schema["labels"]:
+                value = label["value"]
+                if isinstance(value, int):
+                    if value in manual_foreground_values:
+                        label["role"] = "class"
+                        if len(manual_foreground_values) == 1:
+                            label["name"] = self.mask_name_edit.text().strip() or "foreground"
+                    elif value == 0:
+                        label["role"] = "background"
+                        label["name"] = "background"
+                    else:
+                        label["role"] = "ignore"
+        has_background = any(label["role"] == "background" for label in schema["labels"])
+        schema["background_mode"] = "explicit" if has_background else "none"
+        validate_mask_schema(schema)
+
+        foreground_values = {
+            int(label["value"])
+            for label in schema["labels"]
+            if label["role"] == "class" and isinstance(label["value"], int)
+        }
+        background_values = [
+            label["value"] for label in schema["labels"] if label["role"] == "background"
+        ]
+        class_names = [label["name"] for label in schema["labels"] if label["role"] == "class"]
 
         config = {
             "dataset_name": dataset_name,
@@ -1265,8 +1712,13 @@ class MainWindow(QMainWindow):
                 "recursive": recursive,
             },
             "mask": {
-                "type": "binary",
-                "background_value": 0,
+                "type": "binary" if len(class_names) <= 1 else "multiclass",
+                "schema_version": schema["schema_version"],
+                "encoding": schema["encoding"],
+                "background_mode": schema["background_mode"],
+                "labels": schema["labels"],
+                "background_value": background_values[0] if background_values else None,
+                "background_values": background_values,
                 "foreground_values": sorted(foreground_values),
                 "foreground_name": self.mask_name_edit.text().strip() or "foreground",
             },
@@ -1275,7 +1727,8 @@ class MainWindow(QMainWindow):
             "config": config,
             "samples": samples,
             "warnings": warnings,
-            "inspection": inspect_sample_pairs(samples),
+            "inspection": inspection,
+            "mask_schema": schema,
             "image_count": len(supported_files(image_scan_root, IMAGE_EXTS, recursive)),
             "mask_count": len(supported_files(mask_scan_root, MASK_EXTS, recursive)),
             "image_root": image_root,
@@ -1288,12 +1741,16 @@ class MainWindow(QMainWindow):
 
     def format_import_summary(self, data: dict[str, Any]) -> str:
         inspection = data["inspection"]
-        values = inspection["mask_values"]
-        value_text = ", ".join(str(value) for value in values) if values else "未能枚举"
+        labels = inspection["mask_labels"]
+        value_text = ", ".join(mask_label_text(label["value"]) for label in labels) if labels else "未能枚举"
         lines = [
             f"目录图像：{data['image_count']}    目录Mask：{data['mask_count']}",
             f"成功配对：{len(data['samples'])}    警告：{len(data['warnings'])}",
-            f"抽样检查：{inspection['checked']} 对    Mask值：{value_text}",
+            (
+                f"抽样检查：{inspection['checked']} 对    "
+                f"Mask类型：{inspection['mask_encoding']} {inspection['mask_modes']}    "
+                f"标签：{value_text}"
+            ),
             f"抽样尺寸不一致：{inspection['size_mismatches']}    读取错误：{inspection['read_errors']}",
             (
                 f"场景模式：已加载体系（{len(data['taxonomy'].scenes)} 个场景）"
@@ -1301,9 +1758,13 @@ class MainWindow(QMainWindow):
                 else "场景模式：数据集自定义场景（未使用场景体系 JSON）"
             ),
         ]
-        configured_values = data["foreground_values"]
-        if values and not (configured_values & set(values)):
-            lines.append("注意：配置的前景标签值没有出现在抽样Mask中。")
+        class_count = sum(label["role"] == "class" for label in data["mask_schema"]["labels"])
+        ignored_count = sum(label["role"] == "ignore" for label in data["mask_schema"]["labels"])
+        background_count = sum(
+            label["role"] == "background" for label in data["mask_schema"]["labels"]
+        )
+        background_text = f"{background_count} 个背景标签" if background_count else "无背景（全分类）"
+        lines.append(f"类别映射：{class_count} 个有效类别，{background_text}，{ignored_count} 个忽略标签")
         if data["warnings"]:
             lines.append("部分警告：")
             lines.extend(f"- {warning}" for warning in data["warnings"][:4])
@@ -1319,6 +1780,7 @@ class MainWindow(QMainWindow):
             True,
             45,
             data["foreground_values"],
+            data["mask_schema"],
         )
         pixmap = pil_to_qpixmap(image).scaled(
             self.preview_image_label.size(),
@@ -1334,6 +1796,7 @@ class MainWindow(QMainWindow):
         try:
             data = self.collect_import_data()
             self.project_message.setText(self.format_import_summary(data))
+            self.populate_mask_class_table(data["mask_schema"])
             self.show_import_preview_image(data)
         except Exception as exc:
             self.project_message.setText(f"扫描失败：{exc}")
@@ -1353,6 +1816,7 @@ class MainWindow(QMainWindow):
             taxonomy_path = data["taxonomy_path"]
             taxonomy = data["taxonomy"]
             foreground_values = data["foreground_values"]
+            mask_schema = data["mask_schema"]
             dataset_name = config["dataset_name"]
 
             if (workspace / "review.sqlite3").exists():
@@ -1375,6 +1839,8 @@ class MainWindow(QMainWindow):
             self.taxonomy = taxonomy
             self.refresh_taxonomy_controls()
             self.mask_foreground_values = foreground_values
+            self.mask_schema = mask_schema
+            self.refresh_mask_legend()
             workspace.mkdir(parents=True, exist_ok=True)
             (workspace / "exports").mkdir(exist_ok=True)
             (workspace / "cache").mkdir(exist_ok=True)
@@ -1382,11 +1848,12 @@ class MainWindow(QMainWindow):
             self.db = ReviewDatabase(workspace / "review.sqlite3")
             self.dataset_id = self.db.create_dataset(dataset_name, image_root, mask_root, config, self.taxonomy)
             self.db.add_samples(samples, self.dataset_id)
-            value_text = ",".join(str(value) for value in sorted(foreground_values))
-            foreground_name = config["mask"]["foreground_name"]
+            class_names = [
+                label["name"] for label in mask_schema["labels"] if label["role"] == "class"
+            ]
             msg = (
                 f"导入完成：成功配对 {len(samples)} 个样本。"
-                f"Mask 标签：0=背景，{value_text}={foreground_name}。"
+                f"Mask 类型：{mask_schema['encoding']}；有效类别：{', '.join(class_names) or '无'}。"
             )
             if warnings:
                 msg += f" 未配对或警告 {len(warnings)} 条，已跳过。"
@@ -1411,6 +1878,7 @@ class MainWindow(QMainWindow):
         row = self.db.latest_dataset()
         self.taxonomy_path = None
         self.taxonomy = Taxonomy()
+        self.mask_schema = None
         if row and row["config_json"]:
             config = json.loads(row["config_json"])
             configured_taxonomy = str(config.get("taxonomy_path") or "").strip()
@@ -1430,8 +1898,20 @@ class MainWindow(QMainWindow):
                     self.taxonomy = loaded_taxonomy
                     break
             mask_config = config.get("mask", {})
+            labels = mask_config.get("labels")
+            if isinstance(labels, list) and labels:
+                self.mask_schema = {
+                    "schema_version": int(mask_config.get("schema_version", 2)),
+                    "encoding": str(mask_config.get("encoding", "unknown")),
+                    "background_mode": str(
+                        mask_config.get("background_mode")
+                        or ("explicit" if any(label.get("role") == "background" for label in labels) else "none")
+                    ),
+                    "labels": labels,
+                }
             values = mask_config.get("foreground_values")
             self.mask_foreground_values = {int(value) for value in values} if values else None
+        self.refresh_mask_legend()
         self.refresh_taxonomy_controls()
         self.load_review_page()
 
@@ -1500,23 +1980,100 @@ class MainWindow(QMainWindow):
         self.loading = False
         self.refresh_image()
 
-    def refresh_image(self) -> None:
+    def refresh_mask_legend(self) -> None:
+        if not hasattr(self, "mask_legend"):
+            return
+        self.mask_legend.blockSignals(True)
+        self.mask_legend.clear()
+        visible_keys: set[str] = set()
+        if self.mask_schema and self.mask_schema.get("labels"):
+            for label in self.mask_schema["labels"]:
+                role = str(label.get("role") or "class")
+                key = str(label.get("key") or "")
+                color = str(label.get("color") or "#00d7ff")
+                item = QTreeWidgetItem(
+                    ["■", str(label.get("name") or ""), mask_label_text(label.get("value", "")), role]
+                )
+                item.setData(0, Qt.ItemDataRole.UserRole, key)
+                item.setForeground(0, QColor(color))
+                if role == "class":
+                    item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                    item.setCheckState(0, Qt.CheckState.Checked)
+                    visible_keys.add(key)
+                else:
+                    item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
+                self.mask_legend.addTopLevelItem(item)
+        elif self.mask_foreground_values:
+            values = ", ".join(str(value) for value in sorted(self.mask_foreground_values))
+            item = QTreeWidgetItem(["■", "foreground", values, "class"])
+            item.setForeground(0, QColor("#00d7ff"))
+            self.mask_legend.addTopLevelItem(item)
+        self.visible_mask_label_keys = visible_keys if self.mask_schema else None
+        for column in range(4):
+            self.mask_legend.resizeColumnToContents(column)
+        self.mask_legend.blockSignals(False)
+
+    def on_mask_legend_changed(self, _item: QTreeWidgetItem, _column: int) -> None:
+        visible_keys: set[str] = set()
+        for index in range(self.mask_legend.topLevelItemCount()):
+            item = self.mask_legend.topLevelItem(index)
+            if item.checkState(0) == Qt.CheckState.Checked:
+                key = item.data(0, Qt.ItemDataRole.UserRole)
+                if key:
+                    visible_keys.add(str(key))
+        self.visible_mask_label_keys = visible_keys
+        self.refresh_image(clear_canvas=False)
+
+    def update_mask_visibility(self, _state: int | None = None) -> None:
+        self.image_canvas.set_overlay_visible(self.mask_checkbox.isChecked())
+
+    def update_mask_opacity(self, value: int) -> None:
+        self.image_canvas.set_overlay_opacity(value)
+
+    def refresh_image(self, clear_canvas: bool = True) -> None:
         if self.current_index < 0 or self.current_index >= len(self.items):
             return
         sample, _review = self.items[self.current_index]
-        try:
-            image = compose_preview(
-                sample.image_path,
-                sample.mask_path,
-                self.mask_checkbox.isChecked(),
-                self.opacity_slider.value(),
-                self.mask_foreground_values,
-            )
-            self.image_canvas.set_pixmap(pil_to_qpixmap(image))
-            self.path_label.setText(f"image: {sample.image_path}\nmask: {sample.mask_path}")
-        except Exception as exc:
-            self.image_canvas.set_error(str(exc))
-            self.path_label.setText(f"读取失败：{sample.image_path}\n{exc}")
+        for old_request_id, old_task in list(self.render_tasks.items()):
+            if self.render_pool.tryTake(old_task):
+                self.render_tasks.pop(old_request_id, None)
+        self.render_request_id += 1
+        request_id = self.render_request_id
+        task = PreviewRenderTask(
+            request_id,
+            sample.image_path,
+            sample.mask_path,
+            set(self.mask_foreground_values) if self.mask_foreground_values else None,
+            self.mask_schema,
+            set(self.visible_mask_label_keys) if self.visible_mask_label_keys is not None else None,
+        )
+        task.signals.finished.connect(self.on_preview_rendered)
+        self.render_tasks[request_id] = task
+        if clear_canvas:
+            self.image_canvas.set_loading()
+        self.path_label.setText(f"正在加载：{sample.image_path}")
+        self.render_pool.start(task)
+
+    def on_preview_rendered(
+        self,
+        request_id: int,
+        image_path: str,
+        mask_path: str,
+        base_qimage: QImage,
+        overlay_qimage: QImage,
+        error: str,
+    ) -> None:
+        self.render_tasks.pop(request_id, None)
+        if request_id != self.render_request_id:
+            return
+        if error:
+            self.image_canvas.set_error(error)
+            self.path_label.setText(f"读取失败：{image_path}\n{error}")
+            return
+        self.image_canvas.set_layers(QPixmap.fromImage(base_qimage), QPixmap.fromImage(overlay_qimage))
+        self.update_mask_visibility()
+        self.update_mask_opacity(self.opacity_slider.value())
+        self.path_label.setText(f"image: {image_path}\nmask: {mask_path}")
 
     def reload_scene_combo(self) -> None:
         if not hasattr(self, "scene_combo"):
@@ -1740,10 +2297,15 @@ class MainWindow(QMainWindow):
         reviewed = stats["total"] - quality.get("unreviewed", 0)
         return f"已审 {reviewed} / {stats['total']} | accepted {quality.get('accepted', 0)} | rejected {quality.get('rejected', 0)}"
 
+    def default_export_directory(self) -> str:
+        if self.workspace_dir and self.workspace_dir.exists():
+            return str(self.workspace_dir)
+        return str(Path.cwd())
+
     def export_stats(self) -> None:
         if not self.db or self.dataset_id is None:
             return
-        out_dir = QFileDialog.getExistingDirectory(self, "选择统计导出目录", "D:/硕士毕业论文/scene_review_tool")
+        out_dir = QFileDialog.getExistingDirectory(self, "选择统计导出目录", self.default_export_directory())
         if not out_dir:
             return
         out = Path(out_dir)
@@ -1810,7 +2372,7 @@ class MainWindow(QMainWindow):
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
-        out_dir = QFileDialog.getExistingDirectory(self, directory_title, "D:/硕士毕业论文/scene_review_tool")
+        out_dir = QFileDialog.getExistingDirectory(self, directory_title, self.default_export_directory())
         if not out_dir:
             return
         root = Path(out_dir) / f"{directory_prefix}_{time.strftime('%Y%m%d_%H%M%S')}"
