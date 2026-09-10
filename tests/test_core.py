@@ -14,6 +14,7 @@ from scene_review_tool.app import (
     export_review_items,
     infer_mask_schema,
     inspect_sample_pairs,
+    resolve_export_start_directory,
     scan_dataset,
     validate_mask_schema,
 )
@@ -48,6 +49,20 @@ def test_taxonomy_can_be_omitted():
     assert taxonomy.path is None
     assert taxonomy.scenes == []
     assert taxonomy.domains == []
+
+
+def test_export_start_directory_falls_back_and_prefers_existing_paths(tmp_path):
+    fallback = tmp_path / "fallback"
+    workspace = tmp_path / "workspace"
+    previous = tmp_path / "previous-export"
+    fallback.mkdir()
+    workspace.mkdir()
+
+    assert resolve_export_start_directory(None, None, "", fallback) == str(fallback)
+    assert resolve_export_start_directory(None, workspace, "", fallback) == str(workspace)
+
+    previous.mkdir()
+    assert resolve_export_start_directory(previous, workspace, "", fallback) == str(previous)
 
 
 def test_mirrored_subdirectories_scan(tmp_path):

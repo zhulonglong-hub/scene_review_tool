@@ -177,6 +177,21 @@ def normalized_path(path: Path) -> str:
     return str(path.resolve()).replace("\\", "/")
 
 
+def resolve_export_start_directory(
+    last_export_directory: Path | None,
+    workspace_directory: Path | None,
+    workspace_text: str = "",
+    fallback: Path | None = None,
+) -> str:
+    candidates = [last_export_directory, workspace_directory]
+    if workspace_text.strip():
+        candidates.append(Path(workspace_text.strip()))
+    for candidate in candidates:
+        if candidate is not None and candidate.is_dir():
+            return str(candidate)
+    return str(fallback or Path.cwd())
+
+
 def stable_sample_id(dataset_name: str, image_path: Path) -> str:
     stat = image_path.stat()
     raw = f"{dataset_name}|{normalized_path(image_path)}|{stat.st_size}".encode("utf-8")
@@ -1178,6 +1193,8 @@ class MainWindow(QMainWindow):
         self.resize(1500, 900)
         self.taxonomy_path: Path | None = None
         self.taxonomy = Taxonomy()
+        self.workspace_dir: Path | None = None
+        self.last_export_directory: Path | None = None
         self.db: ReviewDatabase | None = None
         self.dataset_id: int | None = None
         self.mask_foreground_values: set[int] | None = {1}
@@ -1842,6 +1859,8 @@ class MainWindow(QMainWindow):
             self.mask_schema = mask_schema
             self.refresh_mask_legend()
             workspace.mkdir(parents=True, exist_ok=True)
+            self.workspace_dir = workspace
+            self.workspace_edit.setText(str(workspace))
             (workspace / "exports").mkdir(exist_ok=True)
             (workspace / "cache").mkdir(exist_ok=True)
             (workspace / "project.json").write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -1866,11 +1885,14 @@ class MainWindow(QMainWindow):
         path = QFileDialog.getExistingDirectory(self, "选择已有工作区", self.workspace_edit.text())
         if not path:
             return
-        db_path = Path(path) / "review.sqlite3"
+        workspace = Path(path)
+        db_path = workspace / "review.sqlite3"
         if not db_path.exists():
             QMessageBox.warning(self, "无法打开", "该工作区没有 review.sqlite3。")
             return
         self.db = ReviewDatabase(db_path)
+        self.workspace_dir = workspace
+        self.workspace_edit.setText(str(workspace))
         self.dataset_id = self.db.latest_dataset_id()
         if self.dataset_id is None:
             QMessageBox.warning(self, "无法打开", "数据库中没有数据集。")
@@ -2298,17 +2320,32 @@ class MainWindow(QMainWindow):
         return f"已审 {reviewed} / {stats['total']} | accepted {quality.get('accepted', 0)} | rejected {quality.get('rejected', 0)}"
 
     def default_export_directory(self) -> str:
-        if self.workspace_dir and self.workspace_dir.exists():
-            return str(self.workspace_dir)
-        return str(Path.cwd())
+        workspace_text = self.workspace_edit.text() if hasattr(self, "workspace_edit") else ""
+        return resolve_export_start_directory(
+            getattr(self, "last_export_directory", None),
+            getattr(self, "workspace_dir", None),
+            workspace_text,
+        )
+
+    def choose_export_directory(self, title: str) -> Path | None:
+        selected = QFileDialog.getExistingDirectory(
+            self,
+            title,
+            self.default_export_directory(),
+            QFileDialog.Option.ShowDirsOnly,
+        )
+        if not selected:
+            return None
+        directory = Path(selected)
+        self.last_export_directory = directory
+        return directory
 
     def export_stats(self) -> None:
         if not self.db or self.dataset_id is None:
             return
-        out_dir = QFileDialog.getExistingDirectory(self, "选择统计导出目录", self.default_export_directory())
-        if not out_dir:
+        out = self.choose_export_directory("选择统计导出目录")
+        if out is None:
             return
-        out = Path(out_dir)
         stats = self.db.stats(self.dataset_id)
         summary_path = out / "review_summary.csv"
         scene_path = out / "scene_statistics.csv"
@@ -2372,10 +2409,10 @@ class MainWindow(QMainWindow):
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
-        out_dir = QFileDialog.getExistingDirectory(self, directory_title, self.default_export_directory())
-        if not out_dir:
+        out_dir = self.choose_export_directory(directory_title)
+        if out_dir is None:
             return
-        root = Path(out_dir) / f"{directory_prefix}_{time.strftime('%Y%m%d_%H%M%S')}"
+        root = out_dir / f"{directory_prefix}_{time.strftime('%Y%m%d_%H%M%S')}"
         try:
             exported = export_review_items(plan, root, group_by_scene)
         except OSError as exc:
