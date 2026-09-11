@@ -123,6 +123,59 @@ def test_generic_relative_path_scan_pairs_duplicate_stems_safely(tmp_path):
     assert {Path(sample.image_path).parent.name for sample in samples} == {"north", "south"}
 
 
+def test_generic_scan_pairs_mask_with_filename_suffix(tmp_path):
+    image_root = tmp_path / "images"
+    mask_root = tmp_path / "masks"
+    image_root.mkdir()
+    mask_root.mkdir()
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(image_root / "P0018.png")
+    Image.new("L", (8, 8), 1).save(mask_root / "P0018_instance_color_RGB.png")
+
+    samples, warnings = scan_dataset(
+        "suffix-demo",
+        image_root,
+        mask_root,
+        "same_stem",
+        "",
+        "",
+        "all",
+        True,
+        "",
+        "_instance_color_RGB",
+    )
+
+    assert warnings == []
+    assert len(samples) == 1
+    assert Path(samples[0].image_path).name == "P0018.png"
+    assert Path(samples[0].mask_path).name == "P0018_instance_color_RGB.png"
+
+
+def test_generic_scan_pairs_mask_with_filename_prefix_and_suffix(tmp_path):
+    image_root = tmp_path / "images"
+    mask_root = tmp_path / "masks"
+    image_root.mkdir()
+    mask_root.mkdir()
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(image_root / "tile.png")
+    Image.new("L", (8, 8), 1).save(mask_root / "mask_tile_label.png")
+
+    samples, warnings = scan_dataset(
+        "prefix-suffix-demo",
+        image_root,
+        mask_root,
+        "same_stem",
+        "",
+        "",
+        "all",
+        True,
+        "mask_",
+        "_label",
+    )
+
+    assert warnings == []
+    assert len(samples) == 1
+    assert Path(samples[0].mask_path).name == "mask_tile_label.png"
+
+
 def test_generic_same_stem_does_not_guess_ambiguous_pairs(tmp_path):
     image_root = tmp_path / "images"
     mask_root = tmp_path / "masks"

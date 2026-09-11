@@ -612,9 +612,36 @@ def scan_dataset(
     mask_dir_name: str,
     split_name: str = "all",
     recursive: bool = True,
+    mask_name_prefix: str = "",
+    mask_name_suffix: str = "",
 ) -> tuple[list[Sample], list[str]]:
     samples: list[Sample] = []
     warnings: list[str] = []
+    mask_name_prefix = mask_name_prefix.strip()
+    mask_name_suffix = mask_name_suffix.strip()
+
+    def normalized_mask_stem(stem: str) -> str:
+        if mask_name_prefix and stem.startswith(mask_name_prefix):
+            stem = stem[len(mask_name_prefix) :]
+        if mask_name_suffix and stem.endswith(mask_name_suffix):
+            stem = stem[: -len(mask_name_suffix)]
+        return stem
+
+    def image_pairing_key(path: Path, root: Path) -> str:
+        if mode == "relative_path_stem":
+            return path.relative_to(root).with_suffix("").as_posix().lower()
+        return path.stem.lower()
+
+    def mask_pairing_key(path: Path, root: Path) -> str:
+        stem = normalized_mask_stem(path.stem)
+        if mode == "relative_path_stem":
+            return path.relative_to(root).with_name(stem).with_suffix("").as_posix().lower()
+        return stem.lower()
+
+    def image_named_mask_candidate(image_path: Path) -> Path:
+        mask_stem = f"{mask_name_prefix}{image_path.stem}{mask_name_suffix}"
+        return image_path.with_name(f"{mask_stem}{image_path.suffix}")
+
     if mode == "voc_segmentation":
         image_dir = image_root / image_dir_name
         mask_dir = mask_root / mask_dir_name
@@ -629,7 +656,7 @@ def scan_dataset(
             if path.is_file() and path.suffix.lower() in IMAGE_EXTS
         }
         mask_by_stem = {
-            path.stem: path
+            normalized_mask_stem(path.stem): path
             for path in mask_dir.iterdir()
             if path.is_file() and path.suffix.lower() in MASK_EXTS
         }
@@ -679,6 +706,8 @@ def scan_dataset(
                 continue
             parts[idx] = mask_dir_name
             candidate = Path(*parts)
+            if mask_name_prefix or mask_name_suffix:
+                candidate = image_named_mask_candidate(candidate)
             mask_path = find_mask_with_extensions(candidate, MASK_EXTS)
             if mask_path is None:
                 warnings.append(f"missing mask: {image_path}")
@@ -702,17 +731,12 @@ def scan_dataset(
             path for path in mask_iter if path.is_file() and path.suffix.lower() in MASK_EXTS
         )
 
-        def pairing_key(path: Path, root: Path) -> str:
-            if mode == "relative_path_stem":
-                return path.relative_to(root).with_suffix("").as_posix().lower()
-            return path.stem.lower()
-
         images_by_key: dict[str, list[Path]] = {}
         masks_by_key: dict[str, list[Path]] = {}
         for image_path in image_files:
-            images_by_key.setdefault(pairing_key(image_path, image_root), []).append(image_path)
+            images_by_key.setdefault(image_pairing_key(image_path, image_root), []).append(image_path)
         for mask_path in mask_files:
-            masks_by_key.setdefault(pairing_key(mask_path, mask_root), []).append(mask_path)
+            masks_by_key.setdefault(mask_pairing_key(mask_path, mask_root), []).append(mask_path)
 
         duplicate_keys = {
             key for key, paths in images_by_key.items() if len(paths) > 1
@@ -723,7 +747,7 @@ def scan_dataset(
             warnings.append(f"ambiguous duplicate pairing key: {key}")
 
         for image_path in image_files:
-            key = pairing_key(image_path, image_root)
+            key = image_pairing_key(image_path, image_root)
             if key in duplicate_keys:
                 continue
             mask_candidates = masks_by_key.get(key, [])
@@ -1250,11 +1274,17 @@ class MainWindow(QMainWindow):
         self.generic_pairing_combo = QComboBox()
         self.generic_pairing_combo.addItem("同名文件（忽略扩展名）", "same_stem")
         self.generic_pairing_combo.addItem("相对路径与文件名均相同", "relative_path_stem")
+        self.mask_name_prefix_edit = QLineEdit()
+        self.mask_name_prefix_edit.setPlaceholderText("可选；例如 mask_")
+        self.mask_name_suffix_edit = QLineEdit()
+        self.mask_name_suffix_edit.setPlaceholderText("可选；例如 _instance_color_RGB")
         self.recursive_checkbox = QCheckBox("扫描子文件夹")
         self.recursive_checkbox.setChecked(True)
         generic_form.addRow("图像文件夹", self._path_row(self.image_root_edit, True))
         generic_form.addRow("Mask文件夹", self._path_row(self.mask_root_edit, True))
         generic_form.addRow("配对规则", self.generic_pairing_combo)
+        generic_form.addRow("Mask文件名前缀", self.mask_name_prefix_edit)
+        generic_form.addRow("Mask文件名后缀", self.mask_name_suffix_edit)
         generic_form.addRow("", self.recursive_checkbox)
         self.import_options_stack.addWidget(generic_page)
 
@@ -1635,6 +1665,8 @@ class MainWindow(QMainWindow):
             mask_dir_name = self.mask_dir_name_edit.text().strip() or "SegmentationClass"
             split = self.split_combo.currentText().strip() or "all"
             recursive = False
+            mask_name_prefix = ""
+            mask_name_suffix = ""
             image_scan_root = dataset_root / image_dir_name
             mask_scan_root = dataset_root / mask_dir_name
             if not dataset_root.is_dir() or not image_scan_root.is_dir() or not mask_scan_root.is_dir():
@@ -1649,6 +1681,8 @@ class MainWindow(QMainWindow):
             mask_dir_name = ""
             split = "all"
             recursive = self.recursive_checkbox.isChecked()
+            mask_name_prefix = self.mask_name_prefix_edit.text().strip()
+            mask_name_suffix = self.mask_name_suffix_edit.text().strip()
             image_scan_root = image_root
             mask_scan_root = mask_root
             if not image_root.is_dir() or not mask_root.is_dir():
@@ -1672,6 +1706,8 @@ class MainWindow(QMainWindow):
             mask_dir_name,
             split,
             recursive,
+            mask_name_prefix,
+            mask_name_suffix,
         )
         if not samples:
             raise ValueError("没有找到成功配对的image-mask样本。请检查路径和配对规则。")
@@ -1727,6 +1763,8 @@ class MainWindow(QMainWindow):
                 "mask_dir_name": mask_dir_name,
                 "split": split,
                 "recursive": recursive,
+                "mask_name_prefix": mask_name_prefix,
+                "mask_name_suffix": mask_name_suffix,
             },
             "mask": {
                 "type": "binary" if len(class_names) <= 1 else "multiclass",
