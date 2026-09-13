@@ -2103,10 +2103,8 @@ class MainWindow(QMainWindow):
         self.current_index = -1
         self.items = self.db.samples(self.dataset_id, self.filter_combo.currentText(), self.search_edit.text())
         self.sample_list.clear()
-        for sample, review in self.items:
-            scene = review.primary_level2_scene or review.custom_scene_name_en or "_"
-            mark = {"accepted": "✓", "needs_correction": "!", "rejected": "x", "unreviewed": "·"}.get(review.quality_status, "·")
-            item = QListWidgetItem(f"{mark} {Path(sample.image_path).name}\n{scene} | {review.scene_status}")
+        for index, (sample, review) in enumerate(self.items):
+            item = QListWidgetItem(self.sample_list_item_text(index, sample, review))
             item.setData(Qt.ItemDataRole.UserRole, sample.id)
             self.sample_list.addItem(item)
         self.update_common_scenes()
@@ -2409,12 +2407,15 @@ class MainWindow(QMainWindow):
         self.update_common_scenes()
         self.status_label.setText(self.format_stats())
 
+    def sample_list_item_text(self, index: int, sample: Sample, review: Review) -> str:
+        scene = review.primary_level2_scene or review.custom_scene_name_en or "_"
+        mark = {"accepted": "✓", "needs_correction": "!", "rejected": "x", "unreviewed": "·"}.get(review.quality_status, "·")
+        return f"{index + 1}. {mark} {Path(sample.image_path).name}\n{scene} | {review.scene_status}"
+
     def update_sample_list_item(self, index: int, sample: Sample, review: Review) -> None:
         current = self.sample_list.item(index)
         if current:
-            scene = review.primary_level2_scene or review.custom_scene_name_en or "_"
-            mark = {"accepted": "✓", "needs_correction": "!", "rejected": "x", "unreviewed": "·"}.get(review.quality_status, "·")
-            current.setText(f"{mark} {Path(sample.image_path).name}\n{scene} | {review.scene_status}")
+            current.setText(self.sample_list_item_text(index, sample, review))
 
     def update_common_scenes(self) -> None:
         if not self.db or self.dataset_id is None or not hasattr(self, "common_scene_list"):

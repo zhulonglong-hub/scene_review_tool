@@ -442,6 +442,34 @@ def test_quality_export_preserves_names_classes_and_literal_notes(tmp_path):
     workbook.close()
 
 
+def test_sample_list_displays_sequence_numbers(tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QApplication
+    from scene_review_tool.app import MainWindow
+
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    db = ReviewDatabase(tmp_path / "review.sqlite3")
+    dataset = db.create_dataset("demo", tmp_path, tmp_path, {}, Taxonomy())
+    samples = [
+        Sample("a", str(tmp_path / "P0018.png"), str(tmp_path / "P0018_mask.png"), ""),
+        Sample("b", str(tmp_path / "P0019.png"), str(tmp_path / "P0019_mask.png"), ""),
+    ]
+    db.add_samples(samples, dataset)
+    window.db = db
+    window.dataset_id = dataset
+    monkeypatch.setattr(window, "refresh_image", lambda: None)
+
+    window.reload_samples()
+
+    assert window.sample_list.item(0).text().startswith("1. · P0018.png")
+    assert window.sample_list.item(1).text().startswith("2. · P0019.png")
+    window.update_sample_list_item(1, samples[1], Review(quality_status="accepted"))
+    assert window.sample_list.item(1).text().startswith("2. ✓ P0019.png")
+    window.close()
+    db.close()
+
+
 def test_quality_export_report_only_and_collision_preflight(tmp_path):
     from openpyxl import load_workbook
 
