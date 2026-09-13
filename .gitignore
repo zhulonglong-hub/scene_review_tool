@@ -12,3 +12,4 @@ venv/
 *.log
 .env
 .env.*
+*.egg-info/

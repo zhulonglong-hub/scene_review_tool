@@ -2,13 +2,40 @@
 
 本工具用于对遥感图像-mask 数据集进行本地人工审查和场景精选。
 
-## 启动
+## 环境安装与启动
 
-在项目根目录运行：
+建议为本工具创建独立 Python 环境，避免把 PySide6、numpy、Pillow、openpyxl 等依赖安装到 Anaconda base 或系统 Python 中。下面以 conda 环境为例：
 
 ```powershell
-$env:PYTHONPATH="src"
+cd D:\硕士毕业论文\scene_review_tool
+conda create -n scene_review_tool python=3.11 -y
+conda activate scene_review_tool
+python -m pip install --upgrade pip setuptools wheel
+python -m pip install -e .
 python -m scene_review_tool
+```
+
+`python -m pip install -e .` 会读取项目的 `pyproject.toml`，自动安装运行 UI 所需依赖，包括：
+
+- PySide6：图形界面。
+- Pillow：图像读取与处理。
+- numpy：mask 与图像数组处理。
+- openpyxl：质量导出 Excel 表格。
+
+以后再次运行时，只需要进入项目目录并激活同一个环境：
+
+```powershell
+cd D:\硕士毕业论文\scene_review_tool
+conda activate scene_review_tool
+python -m scene_review_tool
+```
+
+如果依赖更新，重新执行：
+
+```powershell
+conda activate scene_review_tool
+cd D:\硕士毕业论文\scene_review_tool
+python -m pip install -e .
 ```
 
 ## 当前初版已支持
@@ -27,7 +54,8 @@ python -m scene_review_tool
 - 大图和 RGB Mask 在后台解析；透明度直接作用于叠加图层，不重复读取文件。
 - 中心图像支持鼠标拖动、Ctrl+滚轮定位缩放、适合窗口和 100% 显示。
 - 勾选显示/隐藏 mask，调节透明度。
-- 逐图选择质量状态。
+- 逐图选择质量状态，可在质量状态下面填写多行质量备注。
+- 备注停止输入约 500 毫秒后自动保存，切换样本、筛选、导出及关闭窗口前保存，并显示保存状态。
 - 场景体系 JSON 为可选项；提供有效体系时可选择一级/二级场景。
 - 未提供场景体系时默认使用数据集自定义场景。
 - 从当前数据集已使用场景中快速复用。
@@ -36,6 +64,9 @@ python -m scene_review_tool
 - 点击常用场景只会填入右侧场景选择候选，点击“确认场景”后才保存。
 - SQLite 自动保存进度。
 - 导出统计 CSV，使用 UTF-8 BOM，Excel 直接打开不乱码。
+- 按质量导出支持勾选合格、不合格、需修改三类，不要求完成场景划分；未审核样本不导出。
+- 质量导出生成“质量审核记录.xlsx”，记录样本质量类型、文本备注、场景及来源和导出路径；取消“同时导出原图和掩膜”可仅导出表格。
+- 导出保留原图及掩膜各自的原始文件名和相对目录，导出前检查路径冲突，避免同名覆盖。
 - 导出全部 accepted 样本，不要求完成场景划分。
 - 将 accepted、场景状态为 assigned 且场景名有效的样本按场景复制导出。
 - 导出前显示数量预览，导出清单记录质量状态和场景状态。

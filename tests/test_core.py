@@ -12,6 +12,7 @@ from scene_review_tool.app import (
     compose_preview,
     compose_preview_layers,
     export_review_items,
+    export_quality_items,
     infer_mask_schema,
     inspect_sample_pairs,
     resolve_export_start_directory,
@@ -387,8 +388,8 @@ def test_export_review_items_writes_status_manifest_and_expected_layout(tmp_path
     exported = export_review_items(plan, root, group_by_scene=True)
 
     assert exported == 1
-    assert (root / "river" / "images" / "sample-id_source.jpg").is_file()
-    assert (root / "river" / "masks" / "sample-id_source.png").is_file()
+    assert (root / "river" / "images" / "source.jpg").is_file()
+    assert (root / "river" / "masks" / "source.png").is_file()
     manifest = (root / "export_manifest.csv").read_text(encoding="utf-8-sig")
     assert "quality_status,scene_status,scene" in manifest
     assert "accepted,assigned,river" in manifest
@@ -406,5 +407,83 @@ def test_quality_export_copies_accepted_sample_without_scene(tmp_path):
     exported = export_review_items(plan, root, group_by_scene=False)
 
     assert exported == 1
-    assert (root / "images" / "quality-id_quality-source.jpg").is_file()
-    assert (root / "masks" / "quality-id_quality-source.png").is_file()
+    assert (root / "images" / "quality-source.jpg").is_file()
+    assert (root / "masks" / "quality-source.png").is_file()
+
+
+def test_quality_export_preserves_names_classes_and_literal_notes(tmp_path):
+    from openpyxl import load_workbook
+
+    image_root = tmp_path / "images"
+    mask_root = tmp_path / "masks"
+    items = []
+    for i, status in enumerate(("accepted", "rejected", "needs_correction", "unreviewed")):
+        group = str(i)
+        image = image_root / group / "P0018.png"
+        mask = mask_root / group / "P0018_instance_color_RGB.png"
+        image.parent.mkdir(parents=True)
+        mask.parent.mkdir(parents=True)
+        Image.new("RGB", (2, 2), (i, 20, 30)).save(image)
+        Image.new("RGB", (2, 2), (40, i, 60)).save(mask)
+        items.append((Sample(group, str(image), str(mask), group),
+                      Review(quality_status=status, reviewer_note="=文字说明\n第二行,备注")))
+    root = tmp_path / "export"
+    assert export_quality_items(items, root, image_root, mask_root,
+                                {"accepted", "rejected", "needs_correction"}) == 3
+    for i, name in enumerate(("合格", "不合格", "需修改")):
+        assert (root / name / "images" / str(i) / "P0018.png").is_file()
+        assert (root / name / "masks" / str(i) / "P0018_instance_color_RGB.png").is_file()
+    workbook = load_workbook(root / "质量审核记录.xlsx")
+    sheet = workbook.active
+    assert sheet.max_row == 4
+    assert [sheet.cell(i, 4).value for i in range(2, 5)] == ["合格", "不合格", "需修改"]
+    assert sheet["E2"].value == "=文字说明\n第二行,备注"
+    assert sheet["E2"].data_type == "s"
+    workbook.close()
+
+
+def test_quality_export_report_only_and_collision_preflight(tmp_path):
+    from openpyxl import load_workbook
+
+    sample = Sample("a", str(tmp_path / "a.png"), str(tmp_path / "a_mask.png"), "")
+    item = (sample, Review(quality_status="rejected", reviewer_note="原因"))
+    root = tmp_path / "report"
+    assert export_quality_items([item], root, tmp_path, tmp_path, {"rejected"}, False) == 1
+    assert not (root / "不合格").exists()
+    workbook = load_workbook(root / "质量审核记录.xlsx")
+    assert workbook.active["I2"].value is None
+    workbook.close()
+    conflict = tmp_path / "conflict"
+    with pytest.raises(ValueError, match="冲突"):
+        export_quality_items([item, item], conflict, tmp_path, tmp_path, {"rejected"}, False)
+    assert not conflict.exists()
+
+
+def test_quality_note_saves_on_selection_and_keeps_saved_scene(tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QApplication
+    from scene_review_tool.app import MainWindow
+
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    db = ReviewDatabase(tmp_path / "review.sqlite3")
+    dataset = db.create_dataset("demo", tmp_path, tmp_path, {}, Taxonomy())
+    samples = [Sample(str(i), str(tmp_path / f"{i}.png"), str(tmp_path / f"{i}_mask.png"), "") for i in range(2)]
+    db.add_samples(samples, dataset)
+    saved = Review(quality_status="rejected", scene_status="assigned", primary_level2_scene="river")
+    db.save_review("0", dataset, saved)
+    window.db = db
+    window.dataset_id = dataset
+    window.items = db.samples(dataset)
+    monkeypatch.setattr(window, "refresh_image", lambda: None)
+    window.on_sample_selected(0)
+    window.custom_en_edit.setText("unconfirmed candidate")
+    window.note_edit.setPlainText("边界不正确\n需要检查")
+    window.on_sample_selected(1)
+    review = db.samples(dataset)[0][1]
+    assert review.reviewer_note == "边界不正确\n需要检查"
+    assert review.primary_level2_scene == "river"
+    assert review.scene_status == "assigned"
+    assert window.note_edit.toPlainText() == ""
+    window.close()
+    db.close()

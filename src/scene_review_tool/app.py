@@ -3,18 +3,19 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import os
 import shutil
 import sqlite3
 import sys
 import time
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 from PIL import Image
-from PySide6.QtCore import QObject, QRunnable, QThreadPool, Qt, Signal, Slot
+from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTimer, Qt, Signal, Slot
 from PySide6.QtGui import QColor, QImage, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -22,6 +23,8 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QFileDialog,
+    QDialog,
+    QDialogButtonBox,
     QFormLayout,
     QFrame,
     QGraphicsScene,
@@ -124,7 +127,22 @@ def build_export_plan(items: list[tuple[Sample, Review]], group_by_scene: bool) 
     )
 
 
-def export_review_items(plan: ExportPlan, root: Path, group_by_scene: bool) -> int:
+def export_review_items(plan: ExportPlan, root: Path, group_by_scene: bool,
+                        image_root: Path | None = None, mask_root: Path | None = None) -> int:
+    if plan.items:
+        image_root = image_root or Path(os.path.commonpath([str(Path(s.image_path).resolve().parent) for s, _ in plan.items]))
+        mask_root = mask_root or Path(os.path.commonpath([str(Path(s.mask_path).resolve().parent) for s, _ in plan.items]))
+    destinations = set()
+    for sample, review in plan.items:
+        scene = review_scene_name(review)
+        safe_scene = "".join(c if c.isalnum() or c in " ._-" else "_" for c in scene).strip() or "_unassigned"
+        prefix = root / safe_scene if group_by_scene else root
+        for source, source_root, kind in ((sample.image_path, image_root, "images"), (sample.mask_path, mask_root, "masks")):
+            target = prefix / kind / Path(source).resolve().relative_to(source_root.resolve())
+            key = str(target.resolve()).casefold()
+            if key in destinations:
+                raise ValueError(f"导出路径冲突：{target}")
+            destinations.add(key)
     root.mkdir(parents=True, exist_ok=False)
     rows: list[list[str]] = []
     for sample, review in plan.items:
@@ -137,8 +155,10 @@ def export_review_items(plan: ExportPlan, root: Path, group_by_scene: bool) -> i
         mask_dir = export_root / "masks"
         image_dir.mkdir(parents=True, exist_ok=True)
         mask_dir.mkdir(parents=True, exist_ok=True)
-        image_dst = image_dir / f"{sample.id}_{Path(sample.image_path).name}"
-        mask_dst = mask_dir / f"{sample.id}_{Path(sample.mask_path).name}"
+        image_dst = image_dir / Path(sample.image_path).resolve().relative_to(image_root.resolve())
+        mask_dst = mask_dir / Path(sample.mask_path).resolve().relative_to(mask_root.resolve())
+        image_dst.parent.mkdir(parents=True, exist_ok=True)
+        mask_dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(sample.image_path, image_dst)
         shutil.copy2(sample.mask_path, mask_dst)
         rows.append([
@@ -151,6 +171,7 @@ def export_review_items(plan: ExportPlan, root: Path, group_by_scene: bool) -> i
             sample.mask_path,
             str(image_dst),
             str(mask_dst),
+            review.reviewer_note,
         ])
     with (root / "export_manifest.csv").open("w", encoding="utf-8-sig", newline="") as f:
         writer = csv.writer(f)
@@ -164,10 +185,77 @@ def export_review_items(plan: ExportPlan, root: Path, group_by_scene: bool) -> i
             "source_mask",
             "export_image",
             "export_mask",
+            "reviewer_note",
         ])
         writer.writerows(rows)
     return len(rows)
 
+
+QUALITY_NAMES = {"accepted": "合格", "rejected": "不合格", "needs_correction": "需修改"}
+
+
+def export_quality_items(
+    items: list[tuple[Sample, Review]],
+    root: Path,
+    image_root: Path,
+    mask_root: Path,
+    statuses: set[str],
+    copy_files: bool = True,
+) -> int:
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Font
+
+    selected = [(s, r) for s, r in items if r.quality_status in statuses and r.quality_status in QUALITY_NAMES]
+    destinations: set[str] = set()
+    planned = []
+    for sample, review in selected:
+        sources = (Path(sample.image_path), Path(sample.mask_path))
+        targets = []
+        for source, source_root, kind in zip(sources, (image_root, mask_root), ("images", "masks")):
+            relative = source.resolve().relative_to(source_root.resolve())
+            target = root / QUALITY_NAMES[review.quality_status] / kind / relative
+            key = str(target.resolve()).casefold()
+            if key in destinations:
+                raise ValueError(f"导出路径冲突：{target}")
+            destinations.add(key)
+            if copy_files and not source.is_file():
+                raise FileNotFoundError(f"找不到源文件：{source}")
+            targets.append(target)
+        planned.append((sample, review, sources, targets))
+    root.mkdir(parents=True, exist_ok=False)
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "质量审核记录"
+    sheet.append(["样本ID", "原图名称", "掩膜名称", "质量类型", "文本描述信息备注",
+                  "场景名称", "原图来源路径", "掩膜来源路径", "原图导出路径", "掩膜导出路径"])
+    try:
+        for sample, review, sources, targets in planned:
+            if copy_files:
+                for source, target in zip(sources, targets):
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(source, target)
+            values = [sample.id, sources[0].name, sources[1].name,
+                      QUALITY_NAMES[review.quality_status], review.reviewer_note,
+                      review_scene_name(review), str(sources[0]), str(sources[1]),
+                      str(targets[0].relative_to(root)) if copy_files else "",
+                      str(targets[1].relative_to(root)) if copy_files else ""]
+            sheet.append(values)
+            for cell in sheet[sheet.max_row]:
+                cell.data_type = "s"
+                cell.alignment = Alignment(vertical="top", wrap_text=True)
+        sheet.freeze_panes = "A2"
+        sheet.auto_filter.ref = sheet.dimensions
+        for cell in sheet[1]:
+            cell.font = Font(bold=True)
+        for column, width in zip("ABCDEFGHIJ", (24, 30, 36, 14, 60, 25, 50, 50, 50, 50)):
+            sheet.column_dimensions[column].width = width
+        workbook.save(root / "质量审核记录.xlsx")
+    except Exception:
+        shutil.rmtree(root)
+        raise
+    finally:
+        workbook.close()
+    return len(selected)
 
 def now_text() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S")
@@ -1232,6 +1320,11 @@ class MainWindow(QMainWindow):
         self.current_index = -1
         self.loading = False
 
+        self.note_timer = QTimer(self)
+        self.note_timer.setSingleShot(True)
+        self.note_timer.setInterval(500)
+        self.note_timer.timeout.connect(self.save_quality_note)
+
         self.stack = QStackedWidget()
         self.project_page = self._build_project_page()
         self.review_page = self._build_review_page()
@@ -1451,6 +1544,8 @@ class MainWindow(QMainWindow):
         self.filter_combo.currentTextChanged.connect(self.reload_samples)
         stats_btn = QPushButton("导出统计")
         stats_btn.clicked.connect(self.export_stats)
+        quality_export_btn = QPushButton("按质量导出")
+        quality_export_btn.clicked.connect(self.export_quality)
         accepted_export_btn = QPushButton("导出合格数据")
         accepted_export_btn.clicked.connect(self.export_accepted)
         export_btn = QPushButton("按场景导出")
@@ -1461,6 +1556,7 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(self.search_edit, 2)
         toolbar.addWidget(self.filter_combo)
         toolbar.addWidget(stats_btn)
+        toolbar.addWidget(quality_export_btn)
         toolbar.addWidget(accepted_export_btn)
         toolbar.addWidget(export_btn)
         toolbar.addWidget(back_btn)
@@ -1549,6 +1645,14 @@ class MainWindow(QMainWindow):
             if status == "unreviewed":
                 radio.setChecked(True)
         self.quality_group.buttonClicked.connect(self.save_quality_status_only)
+        self.note_edit = QTextEdit()
+        self.note_edit.setAcceptRichText(False)
+        self.note_edit.setMaximumHeight(120)
+        self.note_edit.textChanged.connect(self.on_quality_note_changed)
+        q_layout.addWidget(QLabel("质量备注"))
+        q_layout.addWidget(self.note_edit)
+        self.note_save_label = QLabel("")
+        q_layout.addWidget(self.note_save_label)
         layout.addWidget(quality_box)
 
         common_box = QGroupBox("当前数据集常用场景")
@@ -1600,11 +1704,7 @@ class MainWindow(QMainWindow):
         scene_layout.addRow("", self.scene_hint_label)
         layout.addWidget(scene_box)
 
-        note_box = QGroupBox("备注")
-        note_layout = QVBoxLayout(note_box)
-        self.note_edit = QTextEdit()
-        note_layout.addWidget(self.note_edit)
-        layout.addWidget(note_box)
+
         self.refresh_taxonomy_controls()
         return panel
 
@@ -1860,6 +1960,8 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "扫描失败", str(exc))
 
     def create_or_open_project(self) -> None:
+        if not self.save_quality_note():
+            return
         try:
             data = self.collect_import_data()
             config = data["config"]
@@ -1902,6 +2004,10 @@ class MainWindow(QMainWindow):
             (workspace / "exports").mkdir(exist_ok=True)
             (workspace / "cache").mkdir(exist_ok=True)
             (workspace / "project.json").write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
+            self.current_index = -1
+            self.items = []
+            if self.db:
+                self.db.close()
             self.db = ReviewDatabase(workspace / "review.sqlite3")
             self.dataset_id = self.db.create_dataset(dataset_name, image_root, mask_root, config, self.taxonomy)
             self.db.add_samples(samples, self.dataset_id)
@@ -1928,6 +2034,12 @@ class MainWindow(QMainWindow):
         if not db_path.exists():
             QMessageBox.warning(self, "无法打开", "该工作区没有 review.sqlite3。")
             return
+        if not self.save_quality_note():
+            return
+        self.current_index = -1
+        self.items = []
+        if self.db:
+            self.db.close()
         self.db = ReviewDatabase(db_path)
         self.workspace_dir = workspace
         self.workspace_edit.setText(str(workspace))
@@ -1986,6 +2098,9 @@ class MainWindow(QMainWindow):
     def reload_samples(self) -> None:
         if not self.db or self.dataset_id is None:
             return
+        if not self.save_quality_note():
+            return
+        self.current_index = -1
         self.items = self.db.samples(self.dataset_id, self.filter_combo.currentText(), self.search_edit.text())
         self.sample_list.clear()
         for sample, review in self.items:
@@ -2003,6 +2118,12 @@ class MainWindow(QMainWindow):
 
     def on_sample_selected(self, row: int) -> None:
         if row < 0 or row >= len(self.items):
+            return
+        previous = self.current_index
+        if not self.save_quality_note():
+            self.sample_list.blockSignals(True)
+            self.sample_list.setCurrentRow(previous)
+            self.sample_list.blockSignals(False)
             return
         self.current_index = row
         sample, review = self.items[row]
@@ -2037,6 +2158,7 @@ class MainWindow(QMainWindow):
         self.mapping_edit.setText(review.taxonomy_mapping_suggestion)
         self.scene_status_combo.setCurrentText(review.scene_status)
         self.note_edit.setPlainText(review.reviewer_note)
+        self.note_save_label.setText('已保存' if review.reviewer_note else '')
         self.loading = False
         self.refresh_image()
 
@@ -2210,7 +2332,7 @@ class MainWindow(QMainWindow):
             custom_scene_name_en=custom_en,
             custom_scene_name_zh=custom_zh,
             taxonomy_mapping_suggestion=self.mapping_edit.text().strip() if source != "taxonomy" else "",
-            reviewer_note=self.note_edit.toPlainText().strip(),
+            reviewer_note=self.note_edit.toPlainText(),
         )
 
     def save_quality_status_only(self) -> None:
@@ -2231,7 +2353,7 @@ class MainWindow(QMainWindow):
             custom_scene_name_zh=old.custom_scene_name_zh,
             taxonomy_mapping_suggestion=old.taxonomy_mapping_suggestion,
             issue_tags_json=old.issue_tags_json,
-            reviewer_note=old.reviewer_note,
+            reviewer_note=self.note_edit.toPlainText(),
         )
         self.db.save_review(sample.id, self.dataset_id, review)
         self.items[self.current_index] = (sample, review)
@@ -2332,16 +2454,22 @@ class MainWindow(QMainWindow):
         self.scene_hint_label.setText("已填入常用场景候选，可继续修改，点击确认场景后保存。")
 
     def prev_sample(self) -> None:
+        if not self.save_quality_note():
+            return
         self.save_current_review()
         if self.current_index > 0:
             self.sample_list.setCurrentRow(self.current_index - 1)
 
     def next_sample(self) -> None:
+        if not self.save_quality_note():
+            return
         self.save_current_review()
         if self.current_index + 1 < len(self.items):
             self.sample_list.setCurrentRow(self.current_index + 1)
 
     def next_unreviewed(self) -> None:
+        if not self.save_quality_note():
+            return
         self.save_current_review()
         for idx in range(self.current_index + 1, len(self.items)):
             if self.items[idx][1].quality_status == "unreviewed" or self.items[idx][1].scene_status == "unassigned":
@@ -2381,6 +2509,8 @@ class MainWindow(QMainWindow):
     def export_stats(self) -> None:
         if not self.db or self.dataset_id is None:
             return
+        if not self.save_quality_note():
+            return
         out = self.choose_export_directory("选择统计导出目录")
         if out is None:
             return
@@ -2404,6 +2534,87 @@ class MainWindow(QMainWindow):
             writer.writerows(stats["scenes"])
         QMessageBox.information(self, "导出完成", f"已导出：\n{summary_path}\n{scene_path}")
 
+    def on_quality_note_changed(self) -> None:
+        if self.loading:
+            return
+        self.note_save_label.setText("未保存")
+        self.note_timer.start()
+
+    def save_quality_note(self) -> bool:
+        self.note_timer.stop()
+        if self.loading or not self.db or self.dataset_id is None:
+            return True
+        if not 0 <= self.current_index < len(self.items):
+            return True
+        sample, old = self.items[self.current_index]
+        text = self.note_edit.toPlainText()
+        if text == old.reviewer_note:
+            self.note_save_label.setText('已保存' if text else '')
+            return True
+        review = replace(old, reviewer_note=text)
+        try:
+            self.db.conn.execute(
+                "UPDATE reviews SET reviewer_note = ?, updated_at = ? WHERE sample_id = ?",
+                (text, now_text(), sample.id),
+            )
+            if self.db.conn.execute("SELECT changes()").fetchone()[0] == 0:
+                self.db.save_review(sample.id, self.dataset_id, review)
+            else:
+                self.db.conn.commit()
+        except sqlite3.Error as exc:
+            self.db.conn.rollback()
+            self.note_save_label.setText(f"保存失败：{exc}")
+            return False
+        self.items[self.current_index] = (sample, review)
+        self.note_save_label.setText("已保存")
+        return True
+
+    def closeEvent(self, event) -> None:
+        if self.save_quality_note():
+            event.accept()
+        else:
+            event.ignore()
+
+    def export_quality(self) -> None:
+        if not self.db or self.dataset_id is None or not self.save_quality_note():
+            return
+        items = self.db.samples(self.dataset_id, "all", "")
+        counts = Counter(review.quality_status for _, review in items)
+        dialog = QDialog(self)
+        dialog.setWindowTitle("按质量导出")
+        layout = QVBoxLayout(dialog)
+        choices = {}
+        for status, name in QUALITY_NAMES.items():
+            checkbox = QCheckBox(f"{name}（{counts[status]} 张）")
+            checkbox.setChecked(True)
+            layout.addWidget(checkbox)
+            choices[status] = checkbox
+        layout.addWidget(QLabel(f"未审核 {counts['unreviewed']} 张，本次不导出"))
+        copy_checkbox = QCheckBox("同时导出原图和掩膜")
+        copy_checkbox.setChecked(True)
+        layout.addWidget(copy_checkbox)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        statuses = {status for status, checkbox in choices.items() if checkbox.isChecked()}
+        if not any(counts[status] for status in statuses):
+            QMessageBox.information(self, "没有可导出的样本", "请选择包含已审核样本的质量类型。")
+            return
+        destination = self.choose_export_directory("选择质量导出目录")
+        if destination is None:
+            return
+        row = self.db.conn.execute("SELECT image_root, mask_root FROM datasets WHERE id = ?", (self.dataset_id,)).fetchone()
+        root = destination / f"quality_export_{time.strftime('%Y%m%d_%H%M%S')}_{time.time_ns() % 1000000:06d}"
+        try:
+            count = export_quality_items(items, root, Path(row["image_root"]), Path(row["mask_root"]),
+                                         statuses, copy_checkbox.isChecked())
+        except Exception as exc:
+            QMessageBox.critical(self, "导出失败", f"质量导出未完成：\n{exc}")
+            return
+        QMessageBox.information(self, "导出完成", f"已导出 {count} 条质量审核记录：\n{root}")
     def export_accepted(self) -> None:
         self._export_review_data(group_by_scene=False)
 
@@ -2412,6 +2623,8 @@ class MainWindow(QMainWindow):
 
     def _export_review_data(self, group_by_scene: bool) -> None:
         if not self.db or self.dataset_id is None:
+            return
+        if not self.save_quality_note():
             return
         self.save_current_review()
         plan = build_export_plan(self.db.samples(self.dataset_id, "all", ""), group_by_scene)
@@ -2452,8 +2665,9 @@ class MainWindow(QMainWindow):
             return
         root = out_dir / f"{directory_prefix}_{time.strftime('%Y%m%d_%H%M%S')}"
         try:
-            exported = export_review_items(plan, root, group_by_scene)
-        except OSError as exc:
+            row = self.db.conn.execute("SELECT image_root, mask_root FROM datasets WHERE id = ?", (self.dataset_id,)).fetchone()
+            exported = export_review_items(plan, root, group_by_scene, Path(row["image_root"]), Path(row["mask_root"]))
+        except (OSError, ValueError) as exc:
             QMessageBox.critical(self, "导出失败", f"导出过程中发生文件错误：\n{exc}")
             return
         description = "质量合格样本" if not group_by_scene else "质量合格且场景已确认样本"
@@ -2482,7 +2696,7 @@ class MainWindow(QMainWindow):
         for button in self.quality_group.buttons():
             if button.text() == status:
                 button.setChecked(True)
-                self.save_current_review()
+                self.save_quality_status_only()
                 return
 
 
