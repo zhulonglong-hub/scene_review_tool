@@ -56,6 +56,8 @@ from PySide6.QtWidgets import (
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}
 MASK_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}
+DEEPGLOBE_IMAGE_SUFFIX = "_sat"
+DEEPGLOBE_MASK_SUFFIX = "_mask"
 QUALITY_STATUSES = ["unreviewed", "accepted", "needs_correction", "rejected"]
 SCENE_SOURCES = ["taxonomy", "dataset_custom", "candidate_new_taxonomy"]
 
@@ -809,6 +811,59 @@ def scan_dataset(
                     parent_group_id=parent,
                 )
             )
+    elif mode == "deepglobe_suffix":
+        image_files = deepglobe_role_files(
+            image_root, IMAGE_EXTS, DEEPGLOBE_IMAGE_SUFFIX, recursive
+        )
+        mask_files = deepglobe_role_files(
+            mask_root, MASK_EXTS, DEEPGLOBE_MASK_SUFFIX, recursive
+        )
+
+        def deepglobe_key(path: Path, root: Path, suffix: str) -> str:
+            relative_path = path.relative_to(root)
+            stem = relative_path.stem
+            if not stem.lower().endswith(suffix):
+                raise ValueError(f"DeepGlobe 文件名缺少后缀 {suffix}: {path}")
+            normalized_stem = stem[: -len(suffix)]
+            return (relative_path.parent / normalized_stem).as_posix().lower()
+
+        images_by_key: dict[str, list[Path]] = {}
+        masks_by_key: dict[str, list[Path]] = {}
+        for image_path in image_files:
+            key = deepglobe_key(image_path, image_root, DEEPGLOBE_IMAGE_SUFFIX)
+            images_by_key.setdefault(key, []).append(image_path)
+        for mask_path in mask_files:
+            key = deepglobe_key(mask_path, mask_root, DEEPGLOBE_MASK_SUFFIX)
+            masks_by_key.setdefault(key, []).append(mask_path)
+
+        duplicate_keys = {
+            key for key, paths in images_by_key.items() if len(paths) > 1
+        } | {
+            key for key, paths in masks_by_key.items() if len(paths) > 1
+        }
+        for key in sorted(duplicate_keys):
+            warnings.append(f"ambiguous DeepGlobe pairing key: {key}")
+
+        for key, paths in images_by_key.items():
+            if key in duplicate_keys:
+                continue
+            mask_candidates = masks_by_key.get(key, [])
+            if not mask_candidates:
+                warnings.append(f"missing DeepGlobe mask for id: {key}")
+                continue
+            image_path = paths[0]
+            samples.append(
+                Sample(
+                    id=stable_sample_id(dataset_name, image_path),
+                    image_path=normalized_path(image_path),
+                    mask_path=normalized_path(mask_candidates[0]),
+                    parent_group_id=image_path.parent.name,
+                )
+            )
+        for key, paths in masks_by_key.items():
+            if key not in images_by_key and key not in duplicate_keys:
+                for _mask_path in paths:
+                    warnings.append(f"missing DeepGlobe image for id: {key}")
     else:
         image_iter = image_root.rglob("*") if recursive else image_root.iterdir()
         mask_iter = mask_root.rglob("*") if recursive else mask_root.iterdir()
@@ -862,6 +917,20 @@ def scan_dataset(
 def supported_files(root: Path, extensions: set[str], recursive: bool = True) -> list[Path]:
     iterator = root.rglob("*") if recursive else root.iterdir()
     return sorted(path for path in iterator if path.is_file() and path.suffix.lower() in extensions)
+
+
+def deepglobe_role_files(
+    root: Path,
+    extensions: set[str],
+    stem_suffix: str,
+    recursive: bool = True,
+) -> list[Path]:
+    """Return files for one DeepGlobe role when images and masks share a folder."""
+    return [
+        path
+        for path in supported_files(root, extensions, recursive)
+        if path.stem.lower().endswith(stem_suffix)
+    ]
 
 
 LABEL_COLORS = (
@@ -1367,6 +1436,9 @@ class MainWindow(QMainWindow):
         self.generic_pairing_combo = QComboBox()
         self.generic_pairing_combo.addItem("同名文件（忽略扩展名）", "same_stem")
         self.generic_pairing_combo.addItem("相对路径与文件名均相同", "relative_path_stem")
+        self.generic_pairing_combo.addItem(
+            "DeepGlobe（_sat 原图 / _mask 标签）", "deepglobe_suffix"
+        )
         self.mask_name_prefix_edit = QLineEdit()
         self.mask_name_prefix_edit.setPlaceholderText("可选；例如 mask_")
         self.mask_name_suffix_edit = QLineEdit()
@@ -1851,6 +1923,26 @@ class MainWindow(QMainWindow):
         ]
         class_names = [label["name"] for label in schema["labels"] if label["role"] == "class"]
 
+        image_count = len(supported_files(image_scan_root, IMAGE_EXTS, recursive))
+        mask_count = len(supported_files(mask_scan_root, MASK_EXTS, recursive))
+        deepglobe_check: dict[str, int] | None = None
+        if mode == "deepglobe_suffix":
+            image_count = len(
+                deepglobe_role_files(
+                    image_scan_root, IMAGE_EXTS, DEEPGLOBE_IMAGE_SUFFIX, recursive
+                )
+            )
+            mask_count = len(
+                deepglobe_role_files(
+                    mask_scan_root, MASK_EXTS, DEEPGLOBE_MASK_SUFFIX, recursive
+                )
+            )
+            deepglobe_check = {
+                "sat_images": image_count,
+                "mask_labels": mask_count,
+                "paired": len(samples),
+            }
+
         config = {
             "dataset_name": dataset_name,
             "import_type": import_type,
@@ -1884,8 +1976,9 @@ class MainWindow(QMainWindow):
             "warnings": warnings,
             "inspection": inspection,
             "mask_schema": schema,
-            "image_count": len(supported_files(image_scan_root, IMAGE_EXTS, recursive)),
-            "mask_count": len(supported_files(mask_scan_root, MASK_EXTS, recursive)),
+            "image_count": image_count,
+            "mask_count": mask_count,
+            "deepglobe_check": deepglobe_check,
             "image_root": image_root,
             "mask_root": mask_root,
             "workspace": workspace,
@@ -1913,6 +2006,17 @@ class MainWindow(QMainWindow):
                 else "场景模式：数据集自定义场景（未使用场景体系 JSON）"
             ),
         ]
+        deepglobe_check = data.get("deepglobe_check")
+        if deepglobe_check:
+            lines.insert(
+                1,
+                (
+                    "DeepGlobe 自动检查："
+                    f"_sat 原图 {deepglobe_check['sat_images']}    "
+                    f"_mask 标签 {deepglobe_check['mask_labels']}    "
+                    f"成功一对一配对 {deepglobe_check['paired']}"
+                ),
+            )
         class_count = sum(label["role"] == "class" for label in data["mask_schema"]["labels"])
         ignored_count = sum(label["role"] == "ignore" for label in data["mask_schema"]["labels"])
         background_count = sum(

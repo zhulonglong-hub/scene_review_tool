@@ -194,6 +194,34 @@ def test_generic_same_stem_does_not_guess_ambiguous_pairs(tmp_path):
     assert warnings == ["ambiguous duplicate pairing key: tile"]
 
 
+def test_deepglobe_suffix_scan_pairs_shared_folder_and_reports_missing_counterparts(tmp_path):
+    dataset = tmp_path / "deepglobe-road"
+    dataset.mkdir()
+    for sample_id in ("100034", "100081"):
+        Image.new("RGB", (8, 8), (10, 20, 30)).save(dataset / f"{sample_id}_sat.jpg")
+        Image.new("RGB", (8, 8), (255, 255, 255)).save(dataset / f"{sample_id}_mask.png")
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(dataset / "image_only_sat.jpg")
+    Image.new("RGB", (8, 8), (255, 255, 255)).save(dataset / "mask_only_mask.png")
+    (dataset / "100034_mask.png.aux.xml").write_text("metadata", encoding="utf-8")
+
+    samples, warnings = scan_dataset(
+        "deepglobe-road", dataset, dataset, "deepglobe_suffix", "", "", "all", True
+    )
+
+    assert len(samples) == 2
+    assert {
+        (Path(sample.image_path).name, Path(sample.mask_path).name)
+        for sample in samples
+    } == {
+        ("100034_sat.jpg", "100034_mask.png"),
+        ("100081_sat.jpg", "100081_mask.png"),
+    }
+    assert warnings == [
+        "missing DeepGlobe mask for id: image_only",
+        "missing DeepGlobe image for id: mask_only",
+    ]
+
+
 def test_binary_mask_value_one_is_rendered_as_foreground(tmp_path):
     image_path = tmp_path / "image.png"
     mask_path = tmp_path / "mask.png"
