@@ -19,6 +19,7 @@ from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTimer, Qt, Signal, 
 from PySide6.QtGui import QColor, QImage, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
+    QAbstractItemView,
     QButtonGroup,
     QCheckBox,
     QComboBox,
@@ -1618,6 +1619,9 @@ class MainWindow(QMainWindow):
         stats_btn.clicked.connect(self.export_stats)
         quality_export_btn = QPushButton("按质量导出")
         quality_export_btn.clicked.connect(self.export_quality)
+        self.selected_export_btn = QPushButton("导出选中（0）")
+        self.selected_export_btn.setEnabled(False)
+        self.selected_export_btn.clicked.connect(self.export_selected)
         accepted_export_btn = QPushButton("导出合格数据")
         accepted_export_btn.clicked.connect(self.export_accepted)
         export_btn = QPushButton("按场景导出")
@@ -1629,6 +1633,7 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(self.filter_combo)
         toolbar.addWidget(stats_btn)
         toolbar.addWidget(quality_export_btn)
+        toolbar.addWidget(self.selected_export_btn)
         toolbar.addWidget(accepted_export_btn)
         toolbar.addWidget(export_btn)
         toolbar.addWidget(back_btn)
@@ -1636,7 +1641,10 @@ class MainWindow(QMainWindow):
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         self.sample_list = QListWidget()
+        self.sample_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.sample_list.setToolTip("Ctrl+单击选择多个样本；Shift+单击选择连续区间")
         self.sample_list.currentRowChanged.connect(self.on_sample_selected)
+        self.sample_list.itemSelectionChanged.connect(self.update_selected_export_button)
         splitter.addWidget(self.sample_list)
 
         center = QWidget()
@@ -2521,6 +2529,13 @@ class MainWindow(QMainWindow):
         if current:
             current.setText(self.sample_list_item_text(index, sample, review))
 
+    def update_selected_export_button(self) -> None:
+        if not hasattr(self, "selected_export_btn"):
+            return
+        count = len(self.sample_list.selectedIndexes())
+        self.selected_export_btn.setText(f"导出选中（{count}）")
+        self.selected_export_btn.setEnabled(count > 0)
+
     def update_common_scenes(self) -> None:
         if not self.db or self.dataset_id is None or not hasattr(self, "common_scene_list"):
             return
@@ -2680,15 +2695,19 @@ class MainWindow(QMainWindow):
         else:
             event.ignore()
 
-    def export_quality(self) -> None:
-        if not self.db or self.dataset_id is None or not self.save_quality_note():
-            return
-        items = self.db.samples(self.dataset_id, "all", "")
+    def choose_quality_export_options(
+        self,
+        items: list[tuple[Sample, Review]],
+        title: str,
+        scope_text: str = "",
+    ) -> tuple[set[str], bool] | None:
         counts = Counter(review.quality_status for _, review in items)
         dialog = QDialog(self)
-        dialog.setWindowTitle("按质量导出")
+        dialog.setWindowTitle(title)
         layout = QVBoxLayout(dialog)
-        choices = {}
+        if scope_text:
+            layout.addWidget(QLabel(scope_text))
+        choices: dict[str, QCheckBox] = {}
         for status, name in QUALITY_NAMES.items():
             checkbox = QCheckBox(f"{name}（{counts[status]} 张）")
             checkbox.setChecked(True)
@@ -2703,11 +2722,21 @@ class MainWindow(QMainWindow):
         buttons.rejected.connect(dialog.reject)
         layout.addWidget(buttons)
         if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
+            return None
         statuses = {status for status, checkbox in choices.items() if checkbox.isChecked()}
         if not any(counts[status] for status in statuses):
             QMessageBox.information(self, "没有可导出的样本", "请选择包含已审核样本的质量类型。")
+            return None
+        return statuses, copy_checkbox.isChecked()
+
+    def export_quality(self) -> None:
+        if not self.db or self.dataset_id is None or not self.save_quality_note():
             return
+        items = self.db.samples(self.dataset_id, "all", "")
+        options = self.choose_quality_export_options(items, "按质量导出")
+        if options is None:
+            return
+        statuses, copy_files = options
         destination = self.choose_export_directory("选择质量导出目录")
         if destination is None:
             return
@@ -2715,11 +2744,68 @@ class MainWindow(QMainWindow):
         root = destination / f"quality_export_{time.strftime('%Y%m%d_%H%M%S')}_{time.time_ns() % 1000000:06d}"
         try:
             count = export_quality_items(items, root, Path(row["image_root"]), Path(row["mask_root"]),
-                                         statuses, copy_checkbox.isChecked())
+                                         statuses, copy_files)
         except Exception as exc:
             QMessageBox.critical(self, "导出失败", f"质量导出未完成：\n{exc}")
             return
         QMessageBox.information(self, "导出完成", f"已导出 {count} 条质量审核记录：\n{root}")
+
+    def export_selected(self) -> None:
+        if not self.db or self.dataset_id is None or not self.save_quality_note():
+            return
+        selected_ids = [
+            str(index.data(Qt.ItemDataRole.UserRole))
+            for index in sorted(self.sample_list.selectedIndexes(), key=lambda index: index.row())
+            if index.data(Qt.ItemDataRole.UserRole)
+        ]
+        if not selected_ids:
+            QMessageBox.information(self, "没有选中样本", "请先在左侧列表选择要导出的样本。")
+            return
+
+        all_items = self.db.samples(self.dataset_id, "all", "")
+        items_by_id = {sample.id: (sample, review) for sample, review in all_items}
+        selected_items = [items_by_id[sample_id] for sample_id in selected_ids if sample_id in items_by_id]
+        if len(selected_items) != len(selected_ids):
+            QMessageBox.warning(self, "选中样本已变化", "部分选中样本已不存在，请刷新列表后重试。")
+            return
+
+        options = self.choose_quality_export_options(
+            selected_items,
+            "按质量导出选中样本",
+            f"当前选中 {len(selected_items)} 张；只统计和导出这些样本。",
+        )
+        if options is None:
+            return
+        statuses, copy_files = options
+        destination = self.choose_export_directory("选择选中样本导出目录")
+        if destination is None:
+            return
+        dataset = self.db.conn.execute(
+            "SELECT image_root, mask_root FROM datasets WHERE id = ?", (self.dataset_id,)
+        ).fetchone()
+        if dataset is None:
+            QMessageBox.critical(self, "导出失败", "当前数据集记录不存在。")
+            return
+        root = destination / (
+            f"selected_quality_export_{time.strftime('%Y%m%d_%H%M%S')}_"
+            f"{time.time_ns() % 1000000:06d}"
+        )
+        try:
+            exported = export_quality_items(
+                selected_items,
+                root,
+                Path(dataset["image_root"]),
+                Path(dataset["mask_root"]),
+                statuses,
+                copy_files,
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "导出失败", f"选中样本导出未完成：\n{exc}")
+            return
+        QMessageBox.information(
+            self, "导出完成", f"已按质量导出 {exported} 个选中样本：\n{root}"
+        )
+
     def export_accepted(self) -> None:
         self._export_review_data(group_by_scene=False)
 

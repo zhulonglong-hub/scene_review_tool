@@ -498,6 +498,64 @@ def test_sample_list_displays_sequence_numbers(tmp_path, monkeypatch):
     db.close()
 
 
+def test_selected_export_exports_exactly_highlighted_samples(tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QApplication, QMessageBox
+    from scene_review_tool.app import MainWindow
+
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    image_root = tmp_path / "images"
+    mask_root = tmp_path / "masks"
+    image_root.mkdir()
+    mask_root.mkdir()
+    samples = []
+    for index in range(3):
+        image_path = image_root / f"sample_{index}.jpg"
+        mask_path = mask_root / f"sample_{index}.png"
+        Image.new("RGB", (2, 2), (index, 20, 30)).save(image_path)
+        Image.new("L", (2, 2), index).save(mask_path)
+        samples.append(Sample(str(index), str(image_path), str(mask_path), ""))
+
+    db = ReviewDatabase(tmp_path / "review.sqlite3")
+    dataset_id = db.create_dataset("demo", image_root, mask_root, {}, Taxonomy())
+    db.add_samples(samples, dataset_id)
+    db.save_review("0", dataset_id, Review(quality_status="accepted", reviewer_note="保留"))
+    db.save_review("1", dataset_id, Review(quality_status="accepted", reviewer_note="不应导出"))
+    db.save_review("2", dataset_id, Review(quality_status="rejected", reviewer_note="保留"))
+    window.db = db
+    window.dataset_id = dataset_id
+    monkeypatch.setattr(window, "refresh_image", lambda: None)
+    window.reload_samples()
+    window.sample_list.clearSelection()
+    window.sample_list.item(0).setSelected(True)
+    window.sample_list.item(2).setSelected(True)
+    assert window.selected_export_btn.text() == "导出选中（2）"
+
+    destination = tmp_path / "exports"
+    destination.mkdir()
+    monkeypatch.setattr(window, "choose_export_directory", lambda _title: destination)
+    monkeypatch.setattr(
+        window,
+        "choose_quality_export_options",
+        lambda items, title, scope_text="": ({"accepted", "rejected"}, True),
+    )
+    monkeypatch.setattr(QMessageBox, "information", lambda *args, **kwargs: None)
+    window.export_selected()
+
+    export_roots = list(destination.glob("selected_quality_export_*"))
+    assert len(export_roots) == 1
+    export_root = export_roots[0]
+    assert (export_root / "合格" / "images" / "sample_0.jpg").is_file()
+    assert (export_root / "合格" / "masks" / "sample_0.png").is_file()
+    assert (export_root / "不合格" / "images" / "sample_2.jpg").is_file()
+    assert (export_root / "不合格" / "masks" / "sample_2.png").is_file()
+    assert not any(path.name == "sample_1.jpg" for path in export_root.rglob("*.jpg"))
+    assert (export_root / "质量审核记录.xlsx").is_file()
+    window.close()
+    db.close()
+
+
 def test_quality_export_report_only_and_collision_preflight(tmp_path):
     from openpyxl import load_workbook
 
