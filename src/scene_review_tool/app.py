@@ -107,6 +107,33 @@ class ExportPlan:
     invalid_assigned_total: int
 
 
+@dataclass(frozen=True)
+class QualityImportEntry:
+    source_row: int
+    imported_sample_id: str
+    image_name: str
+    mask_name: str
+    quality_status: str
+    reviewer_note: str
+    matched_sample_id: str = ""
+    local_quality_status: str = ""
+    local_reviewer_note: str = ""
+    match_method: str = ""
+    category: str = "invalid"
+    detail: str = ""
+
+
+@dataclass(frozen=True)
+class QualityImportPlan:
+    source_path: Path
+    source_sha256: str
+    sheet_name: str
+    entries: tuple[QualityImportEntry, ...]
+
+    def counts(self) -> Counter[str]:
+        return Counter(entry.category for entry in self.entries)
+
+
 def review_scene_name(review: Review) -> str:
     return review.primary_level2_scene or review.custom_scene_name_en
 
@@ -195,6 +222,286 @@ def export_review_items(plan: ExportPlan, root: Path, group_by_scene: bool,
 
 
 QUALITY_NAMES = {"accepted": "合格", "rejected": "不合格", "needs_correction": "需修改"}
+QUALITY_STATUS_BY_NAME = {
+    "合格": "accepted",
+    "不合格": "rejected",
+    "需修改": "needs_correction",
+    "accepted": "accepted",
+    "rejected": "rejected",
+    "needs_correction": "needs_correction",
+}
+QUALITY_IMPORT_CATEGORY_NAMES = {
+    "ready": "可导入",
+    "note_fill": "可补充备注",
+    "same": "与本地相同",
+    "conflict": "与本地冲突",
+    "unmatched": "未匹配",
+    "invalid": "无效记录",
+    "duplicate": "重复记录",
+    "duplicate_conflict": "表内冲突",
+}
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _name_from_cell(value: Any) -> str:
+    text = str(value or "").strip().replace("\\", "/")
+    return text.rsplit("/", 1)[-1]
+
+
+def _path_key(path: Path, root: Path) -> str:
+    try:
+        return path.resolve().relative_to(root.resolve()).as_posix().casefold()
+    except ValueError:
+        return ""
+
+
+def _suffix_path_candidates(
+    value: Any, relative_index: dict[str, set[str]]
+) -> tuple[set[str], str]:
+    text = str(value or "").strip().replace("\\", "/").strip("/")
+    parts = [part for part in text.split("/") if part and part != "."]
+    for start in range(len(parts)):
+        key = "/".join(parts[start:]).casefold()
+        if key in relative_index:
+            return set(relative_index[key]), key
+    return set(), ""
+
+
+def read_quality_progress_xlsx(
+    path: Path,
+    items: list[tuple[Sample, Review]],
+    image_root: Path,
+    mask_root: Path,
+) -> QualityImportPlan:
+    from openpyxl import load_workbook
+
+    path = path.resolve()
+    if path.suffix.casefold() != ".xlsx":
+        raise ValueError("只支持读取 .xlsx 格式的质量审核记录。")
+    if not path.is_file():
+        raise FileNotFoundError(f"找不到 Excel 文件：{path}")
+    if path.stat().st_size > 100 * 1024 * 1024:
+        raise ValueError("Excel 文件超过 100 MB，请确认是否选择了正确的质量审核记录。")
+
+    aliases = {
+        "sample_id": {"样本id", "sampleid"},
+        "image_name": {"原图名称", "imagename"},
+        "mask_name": {"掩膜名称", "maskname"},
+        "quality": {"质量类型", "qualitystatus"},
+        "note": {"文本描述信息备注", "质量备注", "reviewernote"},
+        "image_source": {"原图来源路径", "sourceimage"},
+        "mask_source": {"掩膜来源路径", "sourcemask"},
+        "image_export": {"原图导出路径", "exportimage"},
+        "mask_export": {"掩膜导出路径", "exportmask"},
+    }
+
+    def normalized_header(value: Any) -> str:
+        return "".join(str(value or "").strip().casefold().replace("_", "").split())
+
+    samples_by_id = {sample.id: (sample, review) for sample, review in items}
+    pair_index: dict[tuple[str, str], set[str]] = {}
+    image_name_index: dict[str, set[str]] = {}
+    image_relative_index: dict[str, set[str]] = {}
+    mask_relative_index: dict[str, set[str]] = {}
+    for sample, _review in items:
+        image_name = Path(sample.image_path).name.casefold()
+        mask_name = Path(sample.mask_path).name.casefold()
+        pair_index.setdefault((image_name, mask_name), set()).add(sample.id)
+        image_name_index.setdefault(image_name, set()).add(sample.id)
+        image_relative = _path_key(Path(sample.image_path), image_root)
+        mask_relative = _path_key(Path(sample.mask_path), mask_root)
+        if image_relative:
+            image_relative_index.setdefault(image_relative, set()).add(sample.id)
+        if mask_relative:
+            mask_relative_index.setdefault(mask_relative, set()).add(sample.id)
+
+    workbook = load_workbook(path, read_only=True, data_only=False)
+    try:
+        sheet = workbook["质量审核记录"] if "质量审核记录" in workbook.sheetnames else workbook.active
+        header_cells = next(sheet.iter_rows(min_row=1, max_row=1), ())
+        header_lookup = {
+            normalized_header(cell.value): index
+            for index, cell in enumerate(header_cells)
+            if normalized_header(cell.value)
+        }
+        columns: dict[str, int] = {}
+        for field, field_aliases in aliases.items():
+            for alias in field_aliases:
+                if alias in header_lookup:
+                    columns[field] = header_lookup[alias]
+                    break
+        if "quality" not in columns:
+            raise ValueError("Excel 缺少“质量类型”列。")
+        if not any(field in columns for field in ("sample_id", "image_name", "image_source", "image_export")):
+            raise ValueError("Excel 缺少可用于识别样本的列。")
+
+        entries: list[QualityImportEntry] = []
+        supported_columns = tuple(columns.values())
+        formula_fields = ("sample_id", "image_name", "mask_name", "quality", "image_source", "mask_source")
+        for row_number, cells in enumerate(sheet.iter_rows(min_row=2), start=2):
+            if row_number > 200001:
+                raise ValueError("Excel 有效范围超过 200000 行，已停止读取。")
+
+            def value(field: str) -> Any:
+                index = columns.get(field)
+                return cells[index].value if index is not None and index < len(cells) else None
+
+            if not any(
+                index < len(cells) and cells[index].value not in (None, "")
+                for index in supported_columns
+            ):
+                continue
+            imported_id = str(value("sample_id") or "").strip()
+            image_name = _name_from_cell(value("image_name"))
+            mask_name = _name_from_cell(value("mask_name"))
+            image_source = value("image_source") or value("image_export")
+            mask_source = value("mask_source") or value("mask_export")
+            image_name = image_name or _name_from_cell(image_source)
+            mask_name = mask_name or _name_from_cell(mask_source)
+            quality_text = str(value("quality") or "").strip()
+            note = str(value("note") or "")
+
+            formula_used = False
+            for field in formula_fields:
+                index = columns.get(field)
+                if index is not None and index < len(cells) and cells[index].data_type == "f":
+                    formula_used = True
+                    break
+            if formula_used:
+                entries.append(QualityImportEntry(
+                    row_number, imported_id, image_name, mask_name, "", note,
+                    category="invalid", detail="识别字段或质量类型不能使用 Excel 公式",
+                ))
+                continue
+
+            quality_status = QUALITY_STATUS_BY_NAME.get(quality_text.casefold(), "")
+            if not quality_status:
+                entries.append(QualityImportEntry(
+                    row_number, imported_id, image_name, mask_name, "", note,
+                    category="invalid", detail=f"无法识别质量类型：{quality_text or '空值'}",
+                ))
+                continue
+
+            matched_ids: set[str] = set()
+            match_method = ""
+            if imported_id and imported_id in samples_by_id:
+                sample = samples_by_id[imported_id][0]
+                if image_name and image_name.casefold() != Path(sample.image_path).name.casefold():
+                    entries.append(QualityImportEntry(
+                        row_number, imported_id, image_name, mask_name, quality_status, note,
+                        category="invalid", detail="样本 ID 存在，但原图名称与本地记录不一致",
+                    ))
+                    continue
+                if mask_name and mask_name.casefold() != Path(sample.mask_path).name.casefold():
+                    entries.append(QualityImportEntry(
+                        row_number, imported_id, image_name, mask_name, quality_status, note,
+                        category="invalid", detail="样本 ID 存在，但掩膜名称与本地记录不一致",
+                    ))
+                    continue
+                matched_ids = {imported_id}
+                match_method = "样本 ID"
+            else:
+                image_candidates, _ = _suffix_path_candidates(image_source, image_relative_index)
+                mask_candidates, _ = _suffix_path_candidates(mask_source, mask_relative_index)
+                if image_source and mask_source:
+                    if image_candidates and mask_candidates:
+                        matched_ids = image_candidates & mask_candidates
+                        if matched_ids:
+                            match_method = "相对路径"
+                elif image_candidates:
+                    matched_ids = image_candidates
+                    match_method = "原图相对路径"
+                elif mask_candidates:
+                    matched_ids = mask_candidates
+                    match_method = "掩膜相对路径"
+
+                if not matched_ids and image_name and mask_name:
+                    matched_ids = set(pair_index.get((image_name.casefold(), mask_name.casefold()), set()))
+                    if matched_ids:
+                        match_method = "原图名 + 掩膜名"
+                elif not matched_ids and image_name and not mask_name:
+                    matched_ids = set(image_name_index.get(image_name.casefold(), set()))
+                    if matched_ids:
+                        match_method = "唯一原图名"
+
+            if len(matched_ids) != 1:
+                detail = "本地工作区中没有找到对应样本"
+                if len(matched_ids) > 1:
+                    detail = f"匹配到 {len(matched_ids)} 个同名样本，无法自动确定"
+                entries.append(QualityImportEntry(
+                    row_number, imported_id, image_name, mask_name, quality_status, note,
+                    category="unmatched", detail=detail,
+                ))
+                continue
+
+            matched_id = next(iter(matched_ids))
+            _sample, local_review = samples_by_id[matched_id]
+            if local_review.quality_status == "unreviewed":
+                category = "ready"
+                detail = "本地未审核，可以导入"
+            elif local_review.quality_status == quality_status and local_review.reviewer_note == note:
+                category = "same"
+                detail = "质量类型和备注均与本地相同"
+            elif (
+                local_review.quality_status == quality_status
+                and not local_review.reviewer_note
+                and bool(note)
+            ):
+                category = "note_fill"
+                detail = "质量类型相同，可以补充本地空白备注"
+            else:
+                category = "conflict"
+                detail = "本地质量类型或备注与导入记录不同"
+            entries.append(QualityImportEntry(
+                row_number, imported_id, image_name, mask_name, quality_status, note,
+                matched_id, local_review.quality_status, local_review.reviewer_note,
+                match_method, category, detail,
+            ))
+    finally:
+        workbook.close()
+
+    if not entries:
+        raise ValueError("Excel 中没有可读取的质量审核记录。")
+
+    indices_by_sample: dict[str, list[int]] = {}
+    for index, entry in enumerate(entries):
+        if entry.matched_sample_id and entry.category not in {"invalid", "unmatched"}:
+            indices_by_sample.setdefault(entry.matched_sample_id, []).append(index)
+    for matched_id, indices in indices_by_sample.items():
+        if len(indices) < 2:
+            continue
+        values = {
+            (entries[index].quality_status, entries[index].reviewer_note)
+            for index in indices
+        }
+        if len(values) == 1:
+            for index in indices[1:]:
+                entries[index] = replace(
+                    entries[index],
+                    category="duplicate",
+                    detail="Excel 中存在完全相同的重复记录，本行将跳过",
+                )
+        else:
+            for index in indices:
+                entries[index] = replace(
+                    entries[index],
+                    category="duplicate_conflict",
+                    detail="Excel 中同一样本存在不同结果，必须先在表格中确认",
+                )
+
+    return QualityImportPlan(
+        source_path=path,
+        source_sha256=_file_sha256(path),
+        sheet_name=sheet.title,
+        entries=tuple(entries),
+    )
 
 
 def export_quality_items(
@@ -204,60 +511,82 @@ def export_quality_items(
     mask_root: Path,
     statuses: set[str],
     copy_files: bool = True,
+    include_table: bool = True,
+    table_statuses: set[str] | None = None,
 ) -> int:
     from openpyxl import Workbook
     from openpyxl.styles import Alignment, Font
 
-    selected = [(s, r) for s, r in items if r.quality_status in statuses and r.quality_status in QUALITY_NAMES]
+    file_statuses = statuses if copy_files else set()
+    report_statuses = (statuses if table_statuses is None else table_statuses) if include_table else set()
+    if not file_statuses and not report_statuses:
+        raise ValueError("请至少选择一个导出项目。")
+    selected = [
+        (s, r) for s, r in items
+        if r.quality_status in (file_statuses | report_statuses) and r.quality_status in QUALITY_NAMES
+    ]
+    if not selected:
+        raise ValueError("所选导出项目没有已审核样本。")
     destinations: set[str] = set()
+    report_samples: set[str] = set()
     planned = []
     for sample, review in selected:
+        if review.quality_status in report_statuses:
+            if sample.id in report_samples:
+                raise ValueError(f"质量表格样本冲突：{sample.id}")
+            report_samples.add(sample.id)
         sources = (Path(sample.image_path), Path(sample.mask_path))
         targets = []
         for source, source_root, kind in zip(sources, (image_root, mask_root), ("images", "masks")):
             relative = source.resolve().relative_to(source_root.resolve())
             target = root / QUALITY_NAMES[review.quality_status] / kind / relative
             key = str(target.resolve()).casefold()
-            if key in destinations:
-                raise ValueError(f"导出路径冲突：{target}")
-            destinations.add(key)
-            if copy_files and not source.is_file():
-                raise FileNotFoundError(f"找不到源文件：{source}")
+            if review.quality_status in file_statuses:
+                if key in destinations:
+                    raise ValueError(f"导出路径冲突：{target}")
+                destinations.add(key)
+                if not source.is_file():
+                    raise FileNotFoundError(f"找不到源文件：{source}")
             targets.append(target)
         planned.append((sample, review, sources, targets))
     root.mkdir(parents=True, exist_ok=False)
-    workbook = Workbook()
-    sheet = workbook.active
-    sheet.title = "质量审核记录"
-    sheet.append(["样本ID", "原图名称", "掩膜名称", "质量类型", "文本描述信息备注",
-                  "场景名称", "原图来源路径", "掩膜来源路径", "原图导出路径", "掩膜导出路径"])
+    workbook = Workbook() if include_table else None
+    sheet = workbook.active if workbook else None
+    if sheet is not None:
+        sheet.title = "质量审核记录"
+        sheet.append(["样本ID", "原图名称", "掩膜名称", "质量类型", "文本描述信息备注",
+                      "场景名称", "原图来源路径", "掩膜来源路径", "原图导出路径", "掩膜导出路径"])
     try:
         for sample, review, sources, targets in planned:
-            if copy_files:
+            if review.quality_status in file_statuses:
                 for source, target in zip(sources, targets):
                     target.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(source, target)
+            if sheet is None or review.quality_status not in report_statuses:
+                continue
             values = [sample.id, sources[0].name, sources[1].name,
                       QUALITY_NAMES[review.quality_status], review.reviewer_note,
                       review_scene_name(review), str(sources[0]), str(sources[1]),
-                      str(targets[0].relative_to(root)) if copy_files else "",
-                      str(targets[1].relative_to(root)) if copy_files else ""]
+                      str(targets[0].relative_to(root)) if review.quality_status in file_statuses else "",
+                      str(targets[1].relative_to(root)) if review.quality_status in file_statuses else ""]
             sheet.append(values)
             for cell in sheet[sheet.max_row]:
                 cell.data_type = "s"
                 cell.alignment = Alignment(vertical="top", wrap_text=True)
-        sheet.freeze_panes = "A2"
-        sheet.auto_filter.ref = sheet.dimensions
-        for cell in sheet[1]:
-            cell.font = Font(bold=True)
-        for column, width in zip("ABCDEFGHIJ", (24, 30, 36, 14, 60, 25, 50, 50, 50, 50)):
-            sheet.column_dimensions[column].width = width
-        workbook.save(root / "质量审核记录.xlsx")
+        if sheet is not None:
+            sheet.freeze_panes = "A2"
+            sheet.auto_filter.ref = sheet.dimensions
+            for cell in sheet[1]:
+                cell.font = Font(bold=True)
+            for column, width in zip("ABCDEFGHIJ", (24, 30, 36, 14, 60, 25, 50, 50, 50, 50)):
+                sheet.column_dimensions[column].width = width
+            workbook.save(root / "质量审核记录.xlsx")
     except Exception:
         shutil.rmtree(root)
         raise
     finally:
-        workbook.close()
+        if workbook is not None:
+            workbook.close()
     return len(selected)
 
 def now_text() -> str:
@@ -419,6 +748,41 @@ class ReviewDatabase:
                 last_used_at TEXT,
                 created_at TEXT NOT NULL,
                 UNIQUE(dataset_id, scene_source, scene_name_en)
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS quality_imports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                dataset_id INTEGER NOT NULL,
+                source_path TEXT NOT NULL,
+                source_sha256 TEXT NOT NULL,
+                sheet_name TEXT NOT NULL,
+                policy TEXT NOT NULL,
+                total_rows INTEGER NOT NULL,
+                applied_count INTEGER NOT NULL,
+                conflict_count INTEGER NOT NULL,
+                unmatched_count INTEGER NOT NULL,
+                invalid_count INTEGER NOT NULL,
+                imported_at TEXT NOT NULL
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS quality_import_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                import_id INTEGER NOT NULL,
+                source_row INTEGER NOT NULL,
+                sample_id TEXT,
+                imported_quality_status TEXT,
+                imported_reviewer_note TEXT,
+                local_quality_status TEXT,
+                local_reviewer_note TEXT,
+                category TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                detail TEXT
             )
             """
         )
@@ -591,6 +955,123 @@ class ReviewDatabase:
         )
         self._touch_scene_vocab(dataset_id, review)
         self.conn.commit()
+
+    def quality_import_seen(self, dataset_id: int, source_sha256: str) -> bool:
+        row = self.conn.execute(
+            "SELECT 1 FROM quality_imports WHERE dataset_id = ? AND source_sha256 = ? LIMIT 1",
+            (dataset_id, source_sha256),
+        ).fetchone()
+        return row is not None
+
+    def backup_to(self, destination: Path) -> None:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        backup = sqlite3.connect(str(destination))
+        try:
+            self.conn.backup(backup)
+        finally:
+            backup.close()
+
+    def apply_quality_import(
+        self,
+        dataset_id: int,
+        plan: QualityImportPlan,
+        policy: str,
+        conflict_overrides: dict[str, str] | None = None,
+    ) -> tuple[int, int]:
+        allowed = {
+            "fill_unreviewed": {"ready"},
+            "keep_local": {"ready", "note_fill"},
+            "use_imported": {"ready", "note_fill", "conflict"},
+        }
+        if policy not in allowed:
+            raise ValueError(f"未知的导入策略：{policy}")
+        applicable = allowed[policy]
+        conflict_overrides = conflict_overrides or {}
+        if any(action not in {"keep_local", "use_imported"} for action in conflict_overrides.values()):
+            raise ValueError("存在未知的逐条冲突处理方式。")
+        imported_at = now_text()
+        def should_apply(entry: QualityImportEntry) -> bool:
+            if entry.category == "conflict":
+                action = conflict_overrides.get(entry.matched_sample_id)
+                if action:
+                    return action == "use_imported"
+            return entry.category in applicable
+
+        applied_count = sum(should_apply(entry) for entry in plan.entries)
+        counts = plan.counts()
+        try:
+            self.conn.execute("BEGIN")
+            cursor = self.conn.execute(
+                """
+                INSERT INTO quality_imports
+                (dataset_id, source_path, source_sha256, sheet_name, policy, total_rows,
+                 applied_count, conflict_count, unmatched_count, invalid_count, imported_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    dataset_id,
+                    str(plan.source_path),
+                    plan.source_sha256,
+                    plan.sheet_name,
+                    policy,
+                    len(plan.entries),
+                    applied_count,
+                    counts["conflict"] + counts["duplicate_conflict"],
+                    counts["unmatched"],
+                    counts["invalid"],
+                    imported_at,
+                ),
+            )
+            import_id = int(cursor.lastrowid)
+            for entry in plan.entries:
+                apply_entry = should_apply(entry)
+                outcome = "applied" if apply_entry else "skipped"
+                if apply_entry:
+                    self.conn.execute(
+                        """
+                        INSERT INTO reviews
+                        (sample_id, quality_status, scene_status, reviewer_note, reviewed_at, updated_at)
+                        VALUES (?, ?, 'unassigned', ?, ?, ?)
+                        ON CONFLICT(sample_id) DO UPDATE SET
+                          quality_status=excluded.quality_status,
+                          reviewer_note=excluded.reviewer_note,
+                          reviewed_at=excluded.reviewed_at,
+                          updated_at=excluded.updated_at
+                        """,
+                        (
+                            entry.matched_sample_id,
+                            entry.quality_status,
+                            entry.reviewer_note,
+                            imported_at,
+                            imported_at,
+                        ),
+                    )
+                self.conn.execute(
+                    """
+                    INSERT INTO quality_import_items
+                    (import_id, source_row, sample_id, imported_quality_status,
+                     imported_reviewer_note, local_quality_status, local_reviewer_note,
+                     category, outcome, detail)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        import_id,
+                        entry.source_row,
+                        entry.matched_sample_id,
+                        entry.quality_status,
+                        entry.reviewer_note,
+                        entry.local_quality_status,
+                        entry.local_reviewer_note,
+                        entry.category,
+                        outcome,
+                        entry.detail,
+                    ),
+                )
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+        return import_id, applied_count
 
     def _touch_scene_vocab(self, dataset_id: int, review: Review) -> None:
         scene_name = review.primary_level2_scene
@@ -1617,6 +2098,8 @@ class MainWindow(QMainWindow):
         self.filter_combo.currentTextChanged.connect(self.reload_samples)
         stats_btn = QPushButton("导出统计")
         stats_btn.clicked.connect(self.export_stats)
+        quality_import_btn = QPushButton("导入质量进度")
+        quality_import_btn.clicked.connect(self.import_quality_progress)
         quality_export_btn = QPushButton("按质量导出")
         quality_export_btn.clicked.connect(self.export_quality)
         self.selected_export_btn = QPushButton("导出选中（0）")
@@ -1632,6 +2115,7 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(self.search_edit, 2)
         toolbar.addWidget(self.filter_combo)
         toolbar.addWidget(stats_btn)
+        toolbar.addWidget(quality_import_btn)
         toolbar.addWidget(quality_export_btn)
         toolbar.addWidget(self.selected_export_btn)
         toolbar.addWidget(accepted_export_btn)
@@ -2695,6 +3179,242 @@ class MainWindow(QMainWindow):
         else:
             event.ignore()
 
+    def choose_quality_import_policy(
+        self, plan: QualityImportPlan
+    ) -> tuple[str, dict[str, str]] | None:
+        counts = plan.counts()
+        dialog = QDialog(self)
+        dialog.setWindowTitle("预览质量进度导入")
+        dialog.resize(1050, 620)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel(
+            f"文件：{plan.source_path.name}\n"
+            f"记录 {len(plan.entries)} 条 | 可导入 {counts['ready']} | "
+            f"可补备注 {counts['note_fill']} | 相同 {counts['same']} | "
+            f"冲突 {counts['conflict'] + counts['duplicate_conflict']} | "
+            f"未匹配 {counts['unmatched']} | 无效 {counts['invalid']} | "
+            f"重复 {counts['duplicate']}"
+        ))
+        layout.addWidget(QLabel("本功能只同步质量类型和质量备注，不会修改已有场景划分。"))
+
+        policy_combo = QComboBox()
+        policy_combo.addItem("仅填充本地未审核样本（推荐）", "fill_unreviewed")
+        policy_combo.addItem("保留本地结果，并补充空白备注", "keep_local")
+        policy_combo.addItem("采用导入结果，覆盖冲突样本", "use_imported")
+        form = QFormLayout()
+        form.addRow("合并策略", policy_combo)
+        layout.addLayout(form)
+
+        apply_label = QLabel()
+        layout.addWidget(apply_label)
+
+        noteworthy = [
+            entry for entry in plan.entries
+            if entry.category not in {"ready", "same"}
+        ]
+        shown = noteworthy[:500] if noteworthy else list(plan.entries[:100])
+        table = QTableWidget(len(shown), 10)
+        table.setHorizontalHeaderLabels([
+            "Excel 行", "原图", "导入质量", "本地质量", "导入备注",
+            "本地备注", "匹配方式", "处理状态", "本条处理", "说明"
+        ])
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        table.verticalHeader().setVisible(False)
+        conflict_choices: dict[str, QComboBox] = {}
+        for row_index, entry in enumerate(shown):
+            local_name = QUALITY_NAMES.get(entry.local_quality_status, "未审核" if entry.local_quality_status == "unreviewed" else "")
+            values = (
+                str(entry.source_row),
+                entry.image_name,
+                QUALITY_NAMES.get(entry.quality_status, entry.quality_status),
+                local_name,
+                entry.reviewer_note,
+                entry.local_reviewer_note,
+                entry.match_method,
+                QUALITY_IMPORT_CATEGORY_NAMES.get(entry.category, entry.category),
+                "",
+                entry.detail,
+            )
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if column in (1, 4, 5, 9):
+                    item.setToolTip(value)
+                table.setItem(row_index, column, item)
+            if entry.category == "conflict":
+                choice = QComboBox()
+                choice.addItem("跟随批量策略", "")
+                choice.addItem("保留本地", "keep_local")
+                choice.addItem("采用导入", "use_imported")
+                table.setCellWidget(row_index, 8, choice)
+                conflict_choices[entry.matched_sample_id] = choice
+            else:
+                table.item(row_index, 8).setText("-")
+        header = table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(9, QHeaderView.ResizeMode.Stretch)
+        layout.addWidget(table, 1)
+        if len(noteworthy) > len(shown):
+            layout.addWidget(QLabel(f"需关注记录较多，表格仅显示前 {len(shown)} 条；全部记录仍会按所选策略处理。"))
+
+        categories_by_policy = {
+            "fill_unreviewed": {"ready"},
+            "keep_local": {"ready", "note_fill"},
+            "use_imported": {"ready", "note_fill", "conflict"},
+        }
+
+        def update_apply_count() -> None:
+            policy = str(policy_combo.currentData())
+            count = 0
+            overwritten = 0
+            for entry in plan.entries:
+                apply_entry = entry.category in categories_by_policy[policy]
+                if entry.category == "conflict" and entry.matched_sample_id in conflict_choices:
+                    action = str(conflict_choices[entry.matched_sample_id].currentData())
+                    if action:
+                        apply_entry = action == "use_imported"
+                count += apply_entry
+                overwritten += entry.category == "conflict" and apply_entry
+            conflict_text = f"；其中覆盖冲突 {overwritten} 条" if overwritten else ""
+            apply_label.setText(
+                f"确认后将写入 {count} 条记录{conflict_text}。"
+                "未匹配、无效和表内冲突不会写入。"
+            )
+
+        policy_combo.currentIndexChanged.connect(update_apply_count)
+        for choice in conflict_choices.values():
+            choice.currentIndexChanged.connect(update_apply_count)
+        update_apply_count()
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("确认合并")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        overrides = {
+            sample_id: str(choice.currentData())
+            for sample_id, choice in conflict_choices.items()
+            if choice.currentData()
+        }
+        return str(policy_combo.currentData()), overrides
+
+    def import_quality_progress(self) -> None:
+        if not self.db or self.dataset_id is None or not self.save_quality_note():
+            return
+        paths, _selected_filter = QFileDialog.getOpenFileNames(
+            self,
+            "选择成员导出的质量审核记录",
+            self.default_export_directory(),
+            "质量审核记录 (*.xlsx)",
+        )
+        if not paths:
+            return
+        dataset = self.db.conn.execute(
+            "SELECT image_root, mask_root FROM datasets WHERE id = ?",
+            (self.dataset_id,),
+        ).fetchone()
+        if dataset is None:
+            QMessageBox.critical(self, "导入失败", "当前数据集记录不存在。")
+            return
+
+        reports: list[str] = []
+        for path_text in paths:
+            path = Path(path_text)
+            try:
+                items = self.db.samples(self.dataset_id, "all", "")
+                plan = read_quality_progress_xlsx(
+                    path,
+                    items,
+                    Path(dataset["image_root"]),
+                    Path(dataset["mask_root"]),
+                )
+            except Exception as exc:
+                QMessageBox.critical(self, "读取失败", f"{path.name} 无法读取：\n{exc}")
+                continue
+
+            if self.db.quality_import_seen(self.dataset_id, plan.source_sha256):
+                answer = QMessageBox.question(
+                    self,
+                    "文件已经导入过",
+                    f"{path.name} 的内容此前已经导入过。\n"
+                    "再次导入通常不会增加进度，是否仍要查看并继续？",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if answer != QMessageBox.StandardButton.Yes:
+                    reports.append(f"{path.name}：已导入过，本次跳过")
+                    continue
+
+            selection = self.choose_quality_import_policy(plan)
+            if selection is None:
+                reports.append(f"{path.name}：已取消")
+                continue
+            policy, conflict_overrides = selection
+            categories_by_policy = {
+                "fill_unreviewed": {"ready"},
+                "keep_local": {"ready", "note_fill"},
+                "use_imported": {"ready", "note_fill", "conflict"},
+            }
+            expected = 0
+            for entry in plan.entries:
+                apply_entry = entry.category in categories_by_policy[policy]
+                if entry.category == "conflict":
+                    action = conflict_overrides.get(entry.matched_sample_id)
+                    if action:
+                        apply_entry = action == "use_imported"
+                expected += apply_entry
+            backup_path: Path | None = None
+            try:
+                if expected:
+                    backup_root = self.db.db_path.parent / "backups"
+                    backup_path = backup_root / (
+                        f"review_before_quality_import_{time.strftime('%Y%m%d_%H%M%S')}_"
+                        f"{time.time_ns() % 1000000:06d}.sqlite3"
+                    )
+                    self.db.backup_to(backup_path)
+                _import_id, applied = self.db.apply_quality_import(
+                    self.dataset_id, plan, policy, conflict_overrides
+                )
+            except Exception as exc:
+                QMessageBox.critical(
+                    self,
+                    "合并失败",
+                    f"{path.name} 未写入工作区：\n{exc}"
+                    + (f"\n合并前备份：{backup_path}" if backup_path else ""),
+                )
+                continue
+            counts = plan.counts()
+            overwritten = sum(
+                entry.category == "conflict"
+                and (
+                    conflict_overrides.get(entry.matched_sample_id) == "use_imported"
+                    or (
+                        entry.matched_sample_id not in conflict_overrides
+                        and policy == "use_imported"
+                    )
+                )
+                for entry in plan.entries
+            )
+            report = (
+                f"{path.name}：写入 {applied}，覆盖冲突 {overwritten}，"
+                f"冲突跳过 {counts['conflict'] - overwritten}，"
+                f"未匹配 {counts['unmatched']}，无效 {counts['invalid']}"
+            )
+            if backup_path:
+                report += f"；备份 {backup_path.name}"
+            reports.append(report)
+
+        if reports:
+            self.reload_samples()
+            QMessageBox.information(self, "质量进度导入结果", "\n".join(reports))
+
     def choose_quality_export_options(
         self,
         items: list[tuple[Sample, Review]],
@@ -2707,16 +3427,17 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(dialog)
         if scope_text:
             layout.addWidget(QLabel(scope_text))
+        table_checkbox = QCheckBox(f"质量审核记录.xlsx（全部已审核 {sum(counts[status] for status in QUALITY_NAMES)} 条）")
+        table_checkbox.setChecked(True)
+        layout.addWidget(table_checkbox)
         choices: dict[str, QCheckBox] = {}
         for status, name in QUALITY_NAMES.items():
-            checkbox = QCheckBox(f"{name}（{counts[status]} 张）")
+            label = "需修改（待确认）" if status == "needs_correction" else name
+            checkbox = QCheckBox(f"{label}图片与掩膜（{counts[status]} 张）")
             checkbox.setChecked(True)
             layout.addWidget(checkbox)
             choices[status] = checkbox
         layout.addWidget(QLabel(f"未审核 {counts['unreviewed']} 张，本次不导出"))
-        copy_checkbox = QCheckBox("同时导出原图和掩膜")
-        copy_checkbox.setChecked(True)
-        layout.addWidget(copy_checkbox)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
@@ -2724,10 +3445,13 @@ class MainWindow(QMainWindow):
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return None
         statuses = {status for status, checkbox in choices.items() if checkbox.isChecked()}
-        if not any(counts[status] for status in statuses):
-            QMessageBox.information(self, "没有可导出的样本", "请选择包含已审核样本的质量类型。")
+        if not table_checkbox.isChecked() and not statuses:
+            QMessageBox.information(self, "没有选择导出项", "请至少勾选表格或一个质量类别。")
             return None
-        return statuses, copy_checkbox.isChecked()
+        if not any(counts[status] for status in (set(QUALITY_NAMES) if table_checkbox.isChecked() else statuses)):
+            QMessageBox.information(self, "没有可导出的样本", "所选项目中没有已审核样本。")
+            return None
+        return statuses, table_checkbox.isChecked()
 
     def export_quality(self) -> None:
         if not self.db or self.dataset_id is None or not self.save_quality_note():
@@ -2736,15 +3460,18 @@ class MainWindow(QMainWindow):
         options = self.choose_quality_export_options(items, "按质量导出")
         if options is None:
             return
-        statuses, copy_files = options
+        file_statuses, include_table = options
         destination = self.choose_export_directory("选择质量导出目录")
         if destination is None:
             return
         row = self.db.conn.execute("SELECT image_root, mask_root FROM datasets WHERE id = ?", (self.dataset_id,)).fetchone()
         root = destination / f"quality_export_{time.strftime('%Y%m%d_%H%M%S')}_{time.time_ns() % 1000000:06d}"
         try:
-            count = export_quality_items(items, root, Path(row["image_root"]), Path(row["mask_root"]),
-                                         statuses, copy_files)
+            count = export_quality_items(
+                items, root, Path(row["image_root"]), Path(row["mask_root"]),
+                file_statuses, True, include_table,
+                set(QUALITY_NAMES) if include_table else None,
+            )
         except Exception as exc:
             QMessageBox.critical(self, "导出失败", f"质量导出未完成：\n{exc}")
             return
@@ -2776,7 +3503,7 @@ class MainWindow(QMainWindow):
         )
         if options is None:
             return
-        statuses, copy_files = options
+        file_statuses, include_table = options
         destination = self.choose_export_directory("选择选中样本导出目录")
         if destination is None:
             return
@@ -2796,8 +3523,10 @@ class MainWindow(QMainWindow):
                 root,
                 Path(dataset["image_root"]),
                 Path(dataset["mask_root"]),
-                statuses,
-                copy_files,
+                file_statuses,
+                True,
+                include_table,
+                set(QUALITY_NAMES) if include_table else None,
             )
         except Exception as exc:
             QMessageBox.critical(self, "导出失败", f"选中样本导出未完成：\n{exc}")

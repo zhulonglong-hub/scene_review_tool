@@ -6,6 +6,7 @@ from PIL import Image
 from scene_review_tool.app import (
     Review,
     ReviewDatabase,
+    QUALITY_NAMES,
     Sample,
     Taxonomy,
     build_export_plan,
@@ -15,6 +16,7 @@ from scene_review_tool.app import (
     export_quality_items,
     infer_mask_schema,
     inspect_sample_pairs,
+    read_quality_progress_xlsx,
     resolve_export_start_directory,
     scan_dataset,
     validate_mask_schema,
@@ -573,6 +575,55 @@ def test_quality_export_report_only_and_collision_preflight(tmp_path):
     assert not conflict.exists()
 
 
+def test_quality_export_independent_table_and_category_folders(tmp_path):
+    from openpyxl import load_workbook
+
+    image_root = tmp_path / "images"
+    mask_root = tmp_path / "masks"
+    image_root.mkdir()
+    mask_root.mkdir()
+    items = []
+    for status in ("accepted", "rejected", "needs_correction"):
+        image = image_root / f"{status}.png"
+        mask = mask_root / f"{status}.png"
+        Image.new("RGB", (2, 2), (10, 20, 30)).save(image)
+        Image.new("L", (2, 2), 1).save(mask)
+        items.append((Sample(status, str(image), str(mask), ""), Review(quality_status=status)))
+
+    table_only = tmp_path / "table-only"
+    assert export_quality_items(
+        items, table_only, image_root, mask_root, set(),
+        include_table=True, table_statuses=set(QUALITY_NAMES),
+    ) == 3
+    assert not (table_only / "合格").exists()
+    workbook = load_workbook(table_only / "质量审核记录.xlsx")
+    assert workbook.active.max_row == 4
+    workbook.close()
+
+    folders_only = tmp_path / "folders-only"
+    assert export_quality_items(
+        items, folders_only, image_root, mask_root, {"accepted", "needs_correction"},
+        include_table=False,
+    ) == 2
+    assert (folders_only / "合格" / "images" / "accepted.png").is_file()
+    assert (folders_only / "需修改" / "masks" / "needs_correction.png").is_file()
+    assert not (folders_only / "不合格").exists()
+    assert not (folders_only / "质量审核记录.xlsx").exists()
+
+    mixed = tmp_path / "mixed"
+    assert export_quality_items(
+        items, mixed, image_root, mask_root, {"rejected"},
+        include_table=True, table_statuses=set(QUALITY_NAMES),
+    ) == 3
+    assert (mixed / "不合格" / "images" / "rejected.png").is_file()
+    assert not (mixed / "合格").exists()
+    workbook = load_workbook(mixed / "质量审核记录.xlsx")
+    assert workbook.active.max_row == 4
+    assert workbook.active["I2"].value is None
+    assert Path(workbook.active["I3"].value) == Path("不合格") / "images" / "rejected.png"
+    workbook.close()
+
+
 def test_quality_note_saves_on_selection_and_keeps_saved_scene(tmp_path, monkeypatch):
     from PySide6.QtWidgets import QApplication
     from scene_review_tool.app import MainWindow
@@ -601,3 +652,165 @@ def test_quality_note_saves_on_selection_and_keeps_saved_scene(tmp_path, monkeyp
     assert window.note_edit.toPlainText() == ""
     window.close()
     db.close()
+
+
+def test_quality_progress_excel_matches_relative_paths_and_classifies_conflicts(tmp_path):
+    from openpyxl import Workbook
+
+    image_root = tmp_path / "images"
+    mask_root = tmp_path / "masks"
+    samples = []
+    for group in ("north", "south"):
+        image = image_root / group / "P0018.png"
+        mask = mask_root / group / "P0018_mask.png"
+        image.parent.mkdir(parents=True)
+        mask.parent.mkdir(parents=True)
+        Image.new("RGB", (2, 2), (10, 20, 30)).save(image)
+        Image.new("L", (2, 2), 1).save(mask)
+        samples.append(Sample(group, str(image), str(mask), group))
+
+    db = ReviewDatabase(tmp_path / "review.sqlite3")
+    dataset = db.create_dataset("demo", image_root, mask_root, {}, Taxonomy())
+    db.add_samples(samples, dataset)
+    db.save_review(
+        "south",
+        dataset,
+        Review(
+            quality_status="accepted",
+            scene_status="assigned",
+            primary_level2_scene="river",
+            reviewer_note="本地备注",
+        ),
+    )
+
+    excel = tmp_path / "member.xlsx"
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "质量审核记录"
+    sheet.append([
+        "样本ID", "原图名称", "掩膜名称", "质量类型", "文本描述信息备注",
+        "场景名称", "原图来源路径", "掩膜来源路径", "原图导出路径", "掩膜导出路径",
+    ])
+    sheet.append([
+        "member-north", "P0018.png", "P0018_mask.png", "合格", "成员备注", "",
+        "E:/member/images/north/P0018.png", "E:/member/masks/north/P0018_mask.png", "", "",
+    ])
+    sheet.append([
+        "member-south", "P0018.png", "P0018_mask.png", "不合格", "成员冲突", "",
+        "E:/member/images/south/P0018.png", "E:/member/masks/south/P0018_mask.png", "", "",
+    ])
+    workbook.save(excel)
+    workbook.close()
+
+    plan = read_quality_progress_xlsx(
+        excel, db.samples(dataset), image_root, mask_root
+    )
+
+    assert [entry.matched_sample_id for entry in plan.entries] == ["north", "south"]
+    assert [entry.match_method for entry in plan.entries] == ["相对路径", "相对路径"]
+    assert [entry.category for entry in plan.entries] == ["ready", "conflict"]
+
+    _import_id, applied = db.apply_quality_import(dataset, plan, "fill_unreviewed")
+    assert applied == 1
+    reviews = {sample.id: review for sample, review in db.samples(dataset)}
+    assert reviews["north"].quality_status == "accepted"
+    assert reviews["north"].reviewer_note == "成员备注"
+    assert reviews["south"].quality_status == "accepted"
+    assert reviews["south"].reviewer_note == "本地备注"
+    assert reviews["south"].primary_level2_scene == "river"
+    assert db.quality_import_seen(dataset, plan.source_sha256)
+    db.close()
+
+
+def test_quality_progress_import_can_override_quality_without_changing_scene(tmp_path):
+    from openpyxl import Workbook
+
+    image_root = tmp_path / "images"
+    mask_root = tmp_path / "masks"
+    image_root.mkdir()
+    mask_root.mkdir()
+    image = image_root / "unique.png"
+    mask = mask_root / "unique_mask.png"
+    Image.new("RGB", (2, 2), (10, 20, 30)).save(image)
+    Image.new("L", (2, 2), 1).save(mask)
+    sample = Sample("local-id", str(image), str(mask), "")
+    db = ReviewDatabase(tmp_path / "review.sqlite3")
+    dataset = db.create_dataset("demo", image_root, mask_root, {}, Taxonomy())
+    db.add_samples([sample], dataset)
+    db.save_review(
+        sample.id,
+        dataset,
+        Review(
+            quality_status="accepted",
+            scene_status="assigned",
+            primary_level2_scene="wetland",
+            reviewer_note="本地",
+        ),
+    )
+
+    excel = tmp_path / "member.xlsx"
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "质量审核记录"
+    sheet.append(["原图名称", "掩膜名称", "质量类型", "文本描述信息备注"])
+    sheet.append(["unique.png", "unique_mask.png", "需修改", "成员"])
+    workbook.save(excel)
+    workbook.close()
+
+    plan = read_quality_progress_xlsx(
+        excel, db.samples(dataset), image_root, mask_root
+    )
+    assert plan.entries[0].category == "conflict"
+    assert plan.entries[0].match_method == "原图名 + 掩膜名"
+
+    _import_id, applied = db.apply_quality_import(
+        dataset,
+        plan,
+        "fill_unreviewed",
+        {"local-id": "use_imported"},
+    )
+    assert applied == 1
+    review = db.samples(dataset)[0][1]
+    assert review.quality_status == "needs_correction"
+    assert review.reviewer_note == "成员"
+    assert review.scene_status == "assigned"
+    assert review.primary_level2_scene == "wetland"
+    db.close()
+
+
+def test_quality_progress_excel_rejects_ambiguous_and_internal_conflicts(tmp_path):
+    from openpyxl import Workbook
+
+    image_root = tmp_path / "images"
+    mask_root = tmp_path / "masks"
+    samples = []
+    for group in ("a", "b"):
+        image = image_root / group / "same.png"
+        mask = mask_root / group / "same_mask.png"
+        image.parent.mkdir(parents=True)
+        mask.parent.mkdir(parents=True)
+        Image.new("RGB", (2, 2), (10, 20, 30)).save(image)
+        Image.new("L", (2, 2), 1).save(mask)
+        samples.append(Sample(group, str(image), str(mask), group))
+
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "质量审核记录"
+    sheet.append(["样本ID", "原图名称", "掩膜名称", "质量类型", "文本描述信息备注"])
+    sheet.append(["", "same.png", "same_mask.png", "合格", "无法确定目录"])
+    sheet.append(["a", "same.png", "same_mask.png", "合格", "第一条"])
+    sheet.append(["a", "same.png", "same_mask.png", "不合格", "第二条"])
+    excel = tmp_path / "member.xlsx"
+    workbook.save(excel)
+    workbook.close()
+
+    plan = read_quality_progress_xlsx(
+        excel,
+        [(samples[0], Review()), (samples[1], Review())],
+        image_root,
+        mask_root,
+    )
+
+    assert plan.entries[0].category == "unmatched"
+    assert plan.entries[1].category == "duplicate_conflict"
+    assert plan.entries[2].category == "duplicate_conflict"
