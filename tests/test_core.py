@@ -654,6 +654,41 @@ def test_quality_note_saves_on_selection_and_keeps_saved_scene(tmp_path, monkeyp
     db.close()
 
 
+def test_next_unreviewed_skips_quality_reviewed_samples_without_scenes(tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QApplication, QMessageBox
+    from scene_review_tool.app import MainWindow
+
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    db = ReviewDatabase(tmp_path / "review.sqlite3")
+    dataset = db.create_dataset("demo", tmp_path, tmp_path, {}, Taxonomy())
+    samples = [
+        Sample(str(index), str(tmp_path / f"{index}.png"), str(tmp_path / f"{index}_mask.png"), "")
+        for index in range(4)
+    ]
+    db.add_samples(samples, dataset)
+    db.save_review("0", dataset, Review(quality_status="accepted"))
+    db.save_review("1", dataset, Review(quality_status="rejected"))
+    db.save_review("2", dataset, Review(quality_status="needs_correction"))
+    window.db = db
+    window.dataset_id = dataset
+    monkeypatch.setattr(window, "refresh_image", lambda: None)
+    monkeypatch.setattr(QMessageBox, "information", lambda *args, **kwargs: None)
+    window.reload_samples()
+
+    assert window.current_index == 0
+    assert window.items[1][1].scene_status == "unassigned"
+    window.next_unreviewed()
+    assert window.current_index == 3
+    assert window.sample_list.currentRow() == 3
+
+    window.next_unreviewed()
+    assert window.current_index == 3
+    window.close()
+    db.close()
+
+
 def test_quality_progress_excel_matches_relative_paths_and_classifies_conflicts(tmp_path):
     from openpyxl import Workbook
 

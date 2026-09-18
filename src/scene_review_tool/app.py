@@ -3076,10 +3076,10 @@ class MainWindow(QMainWindow):
             return
         self.save_current_review()
         for idx in range(self.current_index + 1, len(self.items)):
-            if self.items[idx][1].quality_status == "unreviewed" or self.items[idx][1].scene_status == "unassigned":
+            if self.items[idx][1].quality_status == "unreviewed":
                 self.sample_list.setCurrentRow(idx)
                 return
-        QMessageBox.information(self, "完成", "当前列表中没有后续未审或未分场景样本。")
+        QMessageBox.information(self, "完成", "当前列表中没有后续质量未审核样本。")
 
     def format_stats(self) -> str:
         if not self.db or self.dataset_id is None:
