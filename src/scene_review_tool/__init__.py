@@ -1,3 +1,3 @@
-"""Scene review tool package."""
+"""遥感数据质量审查与场景人工精选软件 v1.0。"""
 
-__version__ = "0.1.0"
+__version__ = "v1.0"

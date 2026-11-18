@@ -1,4 +1,4 @@
-# Scene Review Tool
+# 遥感数据质量审查与场景人工精选软件 v1.0
 
 本工具用于对遥感图像-mask 数据集进行本地人工审查和场景精选。
 
@@ -6,8 +6,10 @@
 
 建议为本工具创建独立 Python 环境，避免把 PySide6、numpy、Pillow、openpyxl 等依赖安装到 Anaconda base 或系统 Python 中。下面以 conda 环境为例：
 
+先进入项目根目录（即包含 `pyproject.toml` 的目录）。例如，从项目父目录执行：
+
 ```powershell
-cd D:\硕士毕业论文\scene_review_tool
+cd .\scene_review_tool
 conda create -n scene_review_tool python=3.11 -y
 conda activate scene_review_tool
 python -m pip install --upgrade pip setuptools wheel
@@ -25,7 +27,7 @@ python -m scene_review_tool
 以后再次运行时，只需要进入项目目录并激活同一个环境：
 
 ```powershell
-cd D:\硕士毕业论文\scene_review_tool
+cd <项目所在路径>\scene_review_tool
 conda activate scene_review_tool
 python -m scene_review_tool
 ```
@@ -34,11 +36,11 @@ python -m scene_review_tool
 
 ```powershell
 conda activate scene_review_tool
-cd D:\硕士毕业论文\scene_review_tool
+cd <项目所在路径>\scene_review_tool
 python -m pip install -e .
 ```
 
-## 当前初版已支持
+## v1.0 已支持
 
 - 默认使用“通用图像-Mask文件夹”导入，只需分别选择两个文件夹。
 - 通用模式支持同名 stem 配对，以及相对路径 + stem 配对。
@@ -97,4 +99,4 @@ DeepGlobe Road/LandCover 等命名为 `编号_sat.jpg` 与 `编号_mask.png` 的
 
 ## 说明
 
-当前版本是 UI 初版，重点验证人工精选流程是否顺手。连续色彩图、超大类别集合、TIFF/GeoTIFF 高位深显示、审查页常驻类别图例、缩略图缓存和后台预加载属于下一阶段优化。
+当前发布版本为 v1.0。连续色彩图、超大类别集合、TIFF/GeoTIFF 高位深及多波段显示、缩略图缓存和后台预加载属于后续规划能力，不作为 v1.0 的必备功能或依赖。

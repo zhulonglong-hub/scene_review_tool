@@ -1,7 +1,7 @@
 [project]
 name = "scene-review-tool"
-version = "0.1.0"
-description = "Local UI for remote-sensing image-mask review and scene selection."
+version = "v1.0"
+description = "遥感数据质量审查与场景人工精选软件 v1.0"
 requires-python = ">=3.11"
 dependencies = [
   "PySide6",
