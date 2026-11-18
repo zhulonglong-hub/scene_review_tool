@@ -1,7 +1,7 @@
 [project]
 name = "scene-review-tool"
 version = "v1.0"
-description = "遥感数据质量审查与场景人工精选软件 v1.0"
+description = "遥感数据质量审查与场景精选系统 v1.0"
 requires-python = ">=3.11"
 dependencies = [
   "PySide6",

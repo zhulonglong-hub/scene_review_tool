@@ -1852,7 +1852,7 @@ class ImageCanvas(QGraphicsView):
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("遥感数据质量审查与场景人工精选软件 v1.0")
+        self.setWindowTitle("遥感数据质量审查与场景精选系统 v1.0")
         self.resize(1500, 900)
         self.taxonomy_path: Path | None = None
         self.taxonomy = Taxonomy()
@@ -1887,7 +1887,7 @@ class MainWindow(QMainWindow):
     def _build_project_page(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
-        title = QLabel("遥感数据质量审查与场景人工精选软件 v1.0")
+        title = QLabel("遥感数据质量审查与场景精选系统 v1.0")
         title.setObjectName("title")
         subtitle = QLabel("导入数据集后逐图查看原图与 mask 叠加，人工确认质量和场景，所有结果自动保存。")
         subtitle.setObjectName("subtitle")
